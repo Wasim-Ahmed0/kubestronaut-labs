@@ -1,0 +1,779 @@
+category: Runtime & Platform Security
+labs:
+
+  - id: run-seccomp
+    title: seccomp - restrict the syscalls a container may make
+    difficulty: hard
+    exams: [CKS]
+    concepts: [seccomp, RuntimeDefault, localhost profiles, syscalls]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: RuntimeDefault costs nothing and blocks most container escapes. Then write a custom profile.
+    scenario: |
+      A container can make roughly 300 syscalls by default. Almost no
+      application needs more than a handful, and most published container
+      escapes go through a syscall nobody's app was ever going to call.
+
+      Two levels:
+
+      - `type: RuntimeDefault` - the container runtime's own curated
+        profile. Free, safe, and there is no good reason not to use it.
+      - `type: Localhost` with a `localhostProfile` - your own JSON profile,
+        loaded from the kubelet's seccomp directory on the node.
+
+      Set up both. The custom profile has already been placed on every node
+      at `/var/lib/kubelet/seccomp/profiles/audit.json`.
+    docs:
+      - https://kubernetes.io/docs/tutorials/security/seccomp/
+    tasks:
+      - text: "In namespace `seccomp`, create Pod `default-prof` (`nginxinc/nginx-unprivileged:1.27-alpine`) with a pod-level seccompProfile of type `RuntimeDefault`."
+      - text: "Create Pod `custom-prof` using seccompProfile type `Localhost` with localhostProfile `profiles/audit.json`."
+      - text: "Both pods must be Running."
+      - text: "Record in ConfigMap `seccompinfo` in `seccomp`: key `dir` = the directory on the node that localhostProfile paths are relative to."
+    setup:
+      - kind: shell
+        desc: install a seccomp profile on every node
+        timeout: 300
+        run: |
+          kubectl create ns seccomp
+          for n in $(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" --format '{{.Names}}'); do
+            docker exec "$n" mkdir -p /var/lib/kubelet/seccomp/profiles
+            docker exec -i "$n" sh -c 'cat > /var/lib/kubelet/seccomp/profiles/audit.json' <<'JSON'
+          {
+            "defaultAction": "SCMP_ACT_LOG"
+          }
+          JSON
+          done
+    verify:
+      - id: runtime-default
+        desc: default-prof uses the RuntimeDefault seccomp profile
+        points: 30
+        hint: "spec.securityContext.seccompProfile.type: RuntimeDefault"
+        run: |
+          eq "$(jp pod default-prof '{.spec.securityContext.seccompProfile.type}' -n seccomp)" "RuntimeDefault"
+      - id: localhost
+        desc: custom-prof uses the Localhost profile profiles/audit.json
+        points: 35
+        hint: "type: Localhost plus localhostProfile: profiles/audit.json"
+        run: |
+          eq "$(jp pod custom-prof '{.spec.securityContext.seccompProfile.type}' -n seccomp)" "Localhost" || exit 1
+          eq "$(jp pod custom-prof '{.spec.securityContext.seccompProfile.localhostProfile}' -n seccomp)" "profiles/audit.json"
+      - id: running
+        desc: Both pods are Running
+        points: 25
+        hint: "a wrong localhostProfile path leaves the pod in CreateContainerError"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n seccomp get pod default-prof -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          RETRY=30 retry bash -c '[ "$(kubectl -n seccomp get pod custom-prof -o jsonpath="{.status.phase}")" = "Running" ]'
+      - id: dir
+        desc: You recorded the seccomp root directory
+        points: 10
+        hint: "the kubelet resolves localhostProfile relative to its seccomp root"
+        run: |
+          got=$(jp cm seccompinfo '{.data.dir}' -n seccomp | tr -d ' ' | sed 's:/*$::')
+          eq "$got" "/var/lib/kubelet/seccomp"
+    hints:
+      - title: The two profile types
+        cost: 10
+        text: |
+          ```yaml
+          spec:
+            securityContext:
+              seccompProfile:
+                type: RuntimeDefault
+          ```
+          and
+          ```yaml
+          spec:
+            securityContext:
+              seccompProfile:
+                type: Localhost
+                localhostProfile: profiles/audit.json
+          ```
+          The path is **relative** to `/var/lib/kubelet/seccomp`, never
+          absolute.
+      - title: Where the profile lives
+        cost: 10
+        text: |
+          ```
+          knode kubestronaut-control-plane ls -la /var/lib/kubelet/seccomp/profiles/
+          knode kubestronaut-control-plane cat /var/lib/kubelet/seccomp/profiles/audit.json
+          ```
+          The file must exist on **every** node a pod might land on, or the
+          pod fails to start there with `cannot load seccomp profile`.
+      - title: What the profile does
+        cost: 10
+        text: |
+          `"defaultAction": "SCMP_ACT_LOG"` logs every syscall instead of
+          blocking - the standard way to discover what an app actually
+          needs before you switch to `SCMP_ACT_ERRNO`. Look for the log
+          entries in the node's audit log.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: default-prof, namespace: seccomp}
+      spec:
+        securityContext:
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+          - name: c
+            image: nginxinc/nginx-unprivileged:1.27-alpine
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: custom-prof, namespace: seccomp}
+      spec:
+        securityContext:
+          seccompProfile:
+            type: Localhost
+            localhostProfile: profiles/audit.json
+        containers:
+          - name: c
+            image: nginxinc/nginx-unprivileged:1.27-alpine
+      YAML
+
+      kubectl -n seccomp create configmap seccompinfo --from-literal=dir=/var/lib/kubelet/seccomp
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: default-prof, namespace: seccomp}
+      spec:
+        securityContext:
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+          - name: c
+            image: nginxinc/nginx-unprivileged:1.27-alpine
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: custom-prof, namespace: seccomp}
+      spec:
+        securityContext:
+          seccompProfile:
+            type: Localhost
+            localhostProfile: profiles/audit.json
+        containers:
+          - name: c
+            image: nginxinc/nginx-unprivileged:1.27-alpine
+      YAML
+      kubectl -n seccomp wait --for=condition=Ready pod/default-prof pod/custom-prof --timeout=300s
+      kubectl -n seccomp create configmap seccompinfo --from-literal=dir=/var/lib/kubelet/seccomp
+
+  - id: run-audit-logging
+    title: Turn on API server audit logging
+    difficulty: expert
+    exams: [CKS]
+    concepts: [audit logging, audit policy, kube-apiserver, static pods, forensics]
+    par_minutes: 22
+    estimated_minutes: 30
+    destructive: true
+    blurb: Write an audit policy, wire it into the API server, and prove events are landing.
+    scenario: |
+      Without audit logging you cannot answer "who deleted that Secret".
+      Turning it on means editing the API server's static pod manifest -
+      which means if you get it wrong, the API server does not come back.
+      That is exactly why it is a CKS task.
+
+      Three things have to line up:
+
+      1. An audit **policy** file describing what to log and at what level
+      2. API server **flags** pointing at the policy and a log path
+      3. **volumes and volumeMounts** so the API server container can
+         actually see both paths on the host
+
+      Point 3 is what people forget, and the failure looks like "the API
+      server will not start".
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/
+    tasks:
+      - text: "Write an audit policy at `/etc/kubernetes/audit/policy.yaml` on the control plane node: log Secrets at `Metadata` level, and everything else at `Metadata` too."
+      - text: "Add `--audit-policy-file=/etc/kubernetes/audit/policy.yaml` and `--audit-log-path=/var/log/kubernetes/audit.log` to the kube-apiserver manifest."
+      - text: "Add the hostPath volumes and volumeMounts the API server needs for `/etc/kubernetes/audit` and `/var/log/kubernetes`."
+      - text: "The API server must come back up and `/var/log/kubernetes/audit.log` must contain audit events."
+    setup:
+      - kind: shell
+        desc: prepare the audit directories on the control plane
+        timeout: 300
+        run: |
+          NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" \
+            --format '{{.Names}}' | grep control-plane | head -1)
+          docker exec "$NODE" mkdir -p /etc/kubernetes/audit /var/log/kubernetes
+          docker exec "$NODE" rm -f /var/log/kubernetes/audit.log /etc/kubernetes/audit/policy.yaml
+    verify:
+      - id: policy-file
+        desc: An audit policy file exists and is a valid Policy object
+        points: 25
+        hint: "apiVersion: audit.k8s.io/v1, kind: Policy, with a rules list"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          docker exec "$node" test -f /etc/kubernetes/audit/policy.yaml || exit 1
+          docker exec "$node" grep -q 'kind: Policy' /etc/kubernetes/audit/policy.yaml || exit 1
+          docker exec "$node" grep -q 'audit.k8s.io' /etc/kubernetes/audit/policy.yaml || exit 1
+          docker exec "$node" grep -q 'level:' /etc/kubernetes/audit/policy.yaml
+      - id: flags
+        desc: The API server manifest carries both audit flags
+        points: 25
+        hint: "--audit-policy-file and --audit-log-path in the command list"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          docker exec "$node" grep -q 'audit-policy-file=/etc/kubernetes/audit/policy.yaml' \
+            /etc/kubernetes/manifests/kube-apiserver.yaml || exit 1
+          docker exec "$node" grep -q 'audit-log-path=/var/log/kubernetes/audit.log' \
+            /etc/kubernetes/manifests/kube-apiserver.yaml
+      - id: mounts
+        desc: The manifest mounts both host paths into the container
+        points: 20
+        hint: "a flag pointing at a path the container cannot see is why the API server will not start"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          docker exec "$node" grep -q '/etc/kubernetes/audit' /etc/kubernetes/manifests/kube-apiserver.yaml || exit 1
+          docker exec "$node" grep -q '/var/log/kubernetes' /etc/kubernetes/manifests/kube-apiserver.yaml
+      - id: api-alive
+        desc: The API server came back up after your edit
+        points: 15
+        hint: "give the kubelet up to a minute; if it never returns, check crictl logs"
+        run: |
+          RETRY=45 retry kubectl get --raw /readyz
+      - id: events-flowing
+        desc: Audit events are actually being written
+        points: 15
+        hint: "generate some traffic, then check the log file on the node"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          kubectl get ns >/dev/null 2>&1
+          RETRY=20 retry bash -c "docker exec $node sh -c 'test -s /var/log/kubernetes/audit.log && grep -q auditID /var/log/kubernetes/audit.log'"
+    hints:
+      - title: A minimal working policy
+        cost: 12
+        text: |
+          ```
+          docker exec -i kubestronaut-control-plane \
+            sh -c 'cat > /etc/kubernetes/audit/policy.yaml' <<'YAML'
+          apiVersion: audit.k8s.io/v1
+          kind: Policy
+          rules:
+            - level: Metadata
+              resources:
+                - group: ""
+                  resources: ["secrets"]
+            - level: Metadata
+          YAML
+          ```
+          Rules are evaluated in order and the first match wins, so put the
+          specific rules above the catch-all.
+      - title: The four audit levels
+        cost: 10
+        text: |
+          - `None` - do not log this at all
+          - `Metadata` - who, what, when; no bodies
+          - `Request` - metadata plus the request body
+          - `RequestResponse` - both bodies
+
+          Never use `RequestResponse` for Secrets - you would write the
+          secret values straight into the log file.
+      - title: The manifest edit
+        cost: 14
+        text: |
+          Under `spec.containers[0].command` add:
+          ```
+              - --audit-policy-file=/etc/kubernetes/audit/policy.yaml
+              - --audit-log-path=/var/log/kubernetes/audit.log
+          ```
+          Under `spec.containers[0].volumeMounts` add:
+          ```
+              - name: audit-policy
+                mountPath: /etc/kubernetes/audit
+                readOnly: true
+              - name: audit-log
+                mountPath: /var/log/kubernetes
+          ```
+          Under `spec.volumes` add:
+          ```
+              - name: audit-policy
+                hostPath:
+                  path: /etc/kubernetes/audit
+                  type: DirectoryOrCreate
+              - name: audit-log
+                hostPath:
+                  path: /var/log/kubernetes
+                  type: DirectoryOrCreate
+          ```
+      - title: If the API server does not come back
+        cost: 12
+        text: |
+          ```
+          knode kubestronaut-control-plane
+          crictl ps -a | grep apiserver
+          crictl logs <id> 2>&1 | tail -20
+          ```
+          The two usual causes are a YAML indentation mistake in the
+          manifest, and a flag pointing at a path with no matching
+          volumeMount.
+    solution: |
+      ```bash
+      NODE=kubestronaut-control-plane
+
+      docker exec -i $NODE sh -c 'cat > /etc/kubernetes/audit/policy.yaml' <<'YAML'
+      apiVersion: audit.k8s.io/v1
+      kind: Policy
+      rules:
+        - level: Metadata
+          resources:
+            - group: ""
+              resources: ["secrets"]
+        - level: Metadata
+      YAML
+
+      docker exec $NODE cp /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/apiserver.bak
+
+      docker exec $NODE sh -c "
+        sed -i 's|    - kube-apiserver|    - kube-apiserver\\n    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml\\n    - --audit-log-path=/var/log/kubernetes/audit.log|' \
+          /etc/kubernetes/manifests/kube-apiserver.yaml
+        sed -i 's|    volumeMounts:|    volumeMounts:\\n    - mountPath: /etc/kubernetes/audit\\n      name: audit-policy\\n      readOnly: true\\n    - mountPath: /var/log/kubernetes\\n      name: audit-log|' \
+          /etc/kubernetes/manifests/kube-apiserver.yaml
+        sed -i 's|^  volumes:|  volumes:\\n  - hostPath:\\n      path: /etc/kubernetes/audit\\n      type: DirectoryOrCreate\\n    name: audit-policy\\n  - hostPath:\\n      path: /var/log/kubernetes\\n      type: DirectoryOrCreate\\n    name: audit-log|' \
+          /etc/kubernetes/manifests/kube-apiserver.yaml"
+
+      # wait for the kubelet to restart the static pod
+      kubectl get ns
+      docker exec $NODE tail -2 /var/log/kubernetes/audit.log
+      ```
+      In the exam you would edit the file with vi rather than sed - the
+      point is the three additions, not the tool.
+    solve_script: |
+      NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" --format '{{.Names}}' | grep control-plane | head -1)
+      docker exec -i "$NODE" sh -c 'cat > /etc/kubernetes/audit/policy.yaml' <<'YAML'
+      apiVersion: audit.k8s.io/v1
+      kind: Policy
+      rules:
+        - level: Metadata
+          resources:
+            - group: ""
+              resources: ["secrets"]
+        - level: Metadata
+      YAML
+      docker exec "$NODE" sh -c "sed -i 's|    - kube-apiserver|    - kube-apiserver\n    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml\n    - --audit-log-path=/var/log/kubernetes/audit.log|' /etc/kubernetes/manifests/kube-apiserver.yaml"
+      docker exec "$NODE" sh -c "sed -i '0,/    volumeMounts:/s||    volumeMounts:\n    - mountPath: /etc/kubernetes/audit\n      name: audit-policy\n      readOnly: true\n    - mountPath: /var/log/kubernetes\n      name: audit-log|' /etc/kubernetes/manifests/kube-apiserver.yaml"
+      docker exec "$NODE" sh -c "sed -i '0,/^  volumes:/s||  volumes:\n  - hostPath:\n      path: /etc/kubernetes/audit\n      type: DirectoryOrCreate\n    name: audit-policy\n  - hostPath:\n      path: /var/log/kubernetes\n      type: DirectoryOrCreate\n    name: audit-log|' /etc/kubernetes/manifests/kube-apiserver.yaml"
+      for i in $(seq 1 60); do
+        if kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
+        sleep 5
+      done
+      sleep 15
+      kubectl get ns >/dev/null 2>&1 || true
+      sleep 10
+
+  - id: run-encryption-at-rest
+    title: Encrypt Secrets at rest in etcd
+    difficulty: expert
+    exams: [CKS]
+    concepts: [encryption at rest, EncryptionConfiguration, etcd, secrets, aescbc]
+    par_minutes: 22
+    estimated_minutes: 30
+    destructive: true
+    blurb: Secrets are base64, not encrypted. Fix that, and prove it by reading etcd directly.
+    scenario: |
+      By default a Secret is stored in etcd as plaintext (base64-encoded,
+      which is not encryption). Anyone with the etcd data directory, or an
+      etcd backup, has every credential in your cluster.
+
+      The fix is an `EncryptionConfiguration` handed to the API server with
+      `--encryption-provider-config`. Providers are tried in order for
+      reads, and the **first** one listed is used for writes - which is why
+      the migration recipe is "add the encryption provider above
+      `identity`, restart, then rewrite every Secret".
+
+      Turn it on, then read the raw bytes out of etcd to prove it worked.
+    docs:
+      - https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/
+    tasks:
+      - text: "Write an EncryptionConfiguration at `/etc/kubernetes/enc/enc.yaml` on the control plane node, encrypting `secrets` with an `aescbc` provider (32-byte base64 key), falling back to `identity`."
+      - text: "Add `--encryption-provider-config=/etc/kubernetes/enc/enc.yaml` to the kube-apiserver manifest, with the volume and volumeMount it needs."
+      - text: "Create a Secret `topsecret` in namespace `enc` with `password=classified`."
+      - text: "Prove it is encrypted: reading the key directly out of etcd must show a `k8s:enc:aescbc` prefix, not the plaintext."
+    setup:
+      - kind: shell
+        desc: prepare the encryption directory
+        timeout: 300
+        run: |
+          kubectl create ns enc
+          NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" \
+            --format '{{.Names}}' | grep control-plane | head -1)
+          docker exec "$NODE" mkdir -p /etc/kubernetes/enc
+          docker exec "$NODE" rm -f /etc/kubernetes/enc/enc.yaml
+    verify:
+      - id: config-file
+        desc: A valid EncryptionConfiguration exists on the node
+        points: 25
+        hint: "apiVersion: apiserver.config.k8s.io/v1, kind: EncryptionConfiguration"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          docker exec "$node" test -f /etc/kubernetes/enc/enc.yaml || exit 1
+          docker exec "$node" grep -q 'kind: EncryptionConfiguration' /etc/kubernetes/enc/enc.yaml || exit 1
+          docker exec "$node" grep -q 'aescbc' /etc/kubernetes/enc/enc.yaml || exit 1
+          docker exec "$node" grep -q 'identity' /etc/kubernetes/enc/enc.yaml
+      - id: flag
+        desc: The API server is started with the encryption provider config
+        points: 20
+        hint: "--encryption-provider-config plus a matching volume and volumeMount"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          docker exec "$node" grep -q 'encryption-provider-config=/etc/kubernetes/enc/enc.yaml' \
+            /etc/kubernetes/manifests/kube-apiserver.yaml || exit 1
+          docker exec "$node" grep -q '/etc/kubernetes/enc' /etc/kubernetes/manifests/kube-apiserver.yaml
+      - id: api-alive
+        desc: The API server survived the change
+        points: 15
+        hint: "crictl logs the apiserver container if it does not come back"
+        run: |
+          RETRY=45 retry kubectl get --raw /readyz
+      - id: secret-exists
+        desc: Secret enc/topsecret exists with the right value
+        points: 15
+        hint: "kubectl -n enc create secret generic topsecret --from-literal=password=classified"
+        run: |
+          eq "$(jp secret topsecret '{.data.password}' -n enc | base64 -d 2>/dev/null)" "classified"
+      - id: encrypted-in-etcd
+        desc: The raw etcd value is encrypted, not plaintext
+        points: 25
+        hint: "read /registry/secrets/enc/topsecret straight out of etcd with etcdctl get"
+        run: |
+          E=$(kubectl -n kube-system get pod -l component=etcd -o name | head -1)
+          [ -n "$E" ] || exit 1
+          out=$(kubectl -n kube-system exec "$E" -- etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/server.crt \
+            --key=/etc/kubernetes/pki/etcd/server.key \
+            get /registry/secrets/enc/topsecret 2>/dev/null | head -c 2000)
+          echo "$out" | grep -q 'k8s:enc:aescbc' || exit 1
+          if echo "$out" | grep -q 'classified'; then
+            echo "the plaintext is still visible in etcd" >&2
+            exit 1
+          fi
+          exit 0
+    hints:
+      - title: Generating the key and the config
+        cost: 12
+        text: |
+          ```
+          KEY=$(head -c 32 /dev/urandom | base64)
+
+          docker exec -i kubestronaut-control-plane \
+            sh -c 'cat > /etc/kubernetes/enc/enc.yaml' <<YAML
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: EncryptionConfiguration
+          resources:
+            - resources:
+                - secrets
+              providers:
+                - aescbc:
+                    keys:
+                      - name: key1
+                        secret: $KEY
+                - identity: {}
+          YAML
+          ```
+          The aescbc key must be exactly 32 bytes before base64 encoding.
+      - title: Provider order is the whole trick
+        cost: 12
+        text: |
+          Reads try every provider in order until one works. Writes always
+          use the **first**. So:
+
+          - `aescbc` then `identity` = encrypt on write, still read old
+            plaintext values
+          - `identity` then `aescbc` = decrypt on write; this is how you
+            turn encryption **off** safely
+      - title: Wiring it into the manifest
+        cost: 12
+        text: |
+          Add the flag to the command list, then:
+
+          ```yaml
+          volumeMounts:
+            - name: enc
+              mountPath: /etc/kubernetes/enc
+              readOnly: true
+          volumes:
+            - name: enc
+              hostPath:
+                path: /etc/kubernetes/enc
+                type: DirectoryOrCreate
+          ```
+      - title: Encrypting Secrets that already exist
+        cost: 10
+        text: |
+          Existing Secrets stay in plaintext until something rewrites them:
+
+          ```
+          kubectl get secrets -A -o json | kubectl replace -f -
+          ```
+          Create your Secret *after* enabling encryption and you avoid this.
+    solution: |
+      ```bash
+      NODE=kubestronaut-control-plane
+      KEY=$(head -c 32 /dev/urandom | base64)
+
+      docker exec -i $NODE sh -c 'cat > /etc/kubernetes/enc/enc.yaml' <<YAML
+      apiVersion: apiserver.config.k8s.io/v1
+      kind: EncryptionConfiguration
+      resources:
+        - resources:
+            - secrets
+          providers:
+            - aescbc:
+                keys:
+                  - name: key1
+                    secret: $KEY
+            - identity: {}
+      YAML
+
+      docker exec $NODE sh -c "
+        sed -i 's|    - kube-apiserver|    - kube-apiserver\\n    - --encryption-provider-config=/etc/kubernetes/enc/enc.yaml|' \
+          /etc/kubernetes/manifests/kube-apiserver.yaml
+        sed -i '0,/    volumeMounts:/s||    volumeMounts:\\n    - mountPath: /etc/kubernetes/enc\\n      name: enc\\n      readOnly: true|' \
+          /etc/kubernetes/manifests/kube-apiserver.yaml
+        sed -i '0,/^  volumes:/s||  volumes:\\n  - hostPath:\\n      path: /etc/kubernetes/enc\\n      type: DirectoryOrCreate\\n    name: enc|' \
+          /etc/kubernetes/manifests/kube-apiserver.yaml"
+
+      kubectl -n enc create secret generic topsecret --from-literal=password=classified
+
+      E=$(kubectl -n kube-system get pod -l component=etcd -o name | head -1)
+      kubectl -n kube-system exec $E -- etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        get /registry/secrets/enc/topsecret | head -c 200
+      #   -> k8s:enc:aescbc:v1:key1: ...binary...
+      ```
+    solve_script: |
+      NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" --format '{{.Names}}' | grep control-plane | head -1)
+      KEY=$(head -c 32 /dev/urandom | base64)
+      docker exec -i "$NODE" sh -c 'cat > /etc/kubernetes/enc/enc.yaml' <<YAML
+      apiVersion: apiserver.config.k8s.io/v1
+      kind: EncryptionConfiguration
+      resources:
+        - resources:
+            - secrets
+          providers:
+            - aescbc:
+                keys:
+                  - name: key1
+                    secret: $KEY
+            - identity: {}
+      YAML
+      docker exec "$NODE" sh -c "sed -i 's|    - kube-apiserver|    - kube-apiserver\n    - --encryption-provider-config=/etc/kubernetes/enc/enc.yaml|' /etc/kubernetes/manifests/kube-apiserver.yaml"
+      docker exec "$NODE" sh -c "sed -i '0,/    volumeMounts:/s||    volumeMounts:\n    - mountPath: /etc/kubernetes/enc\n      name: enc\n      readOnly: true|' /etc/kubernetes/manifests/kube-apiserver.yaml"
+      docker exec "$NODE" sh -c "sed -i '0,/^  volumes:/s||  volumes:\n  - hostPath:\n      path: /etc/kubernetes/enc\n      type: DirectoryOrCreate\n    name: enc|' /etc/kubernetes/manifests/kube-apiserver.yaml"
+      for i in $(seq 1 60); do
+        if kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
+        sleep 5
+      done
+      sleep 15
+      kubectl -n enc create secret generic topsecret --from-literal=password=classified
+      sleep 5
+
+  - id: run-admission-policy
+    title: Block bad images with a ValidatingAdmissionPolicy
+    difficulty: expert
+    exams: [CKS]
+    concepts: [admission control, ValidatingAdmissionPolicy, CEL, image policy, governance]
+    par_minutes: 20
+    estimated_minutes: 26
+    blurb: In-tree policy with CEL - no webhook server to run, no extra moving parts.
+    scenario: |
+      Admission webhooks are powerful and operationally painful: a TLS
+      server, certificates, and a failure mode that can wedge your whole
+      cluster.
+
+      `ValidatingAdmissionPolicy` runs CEL expressions inside the API server
+      instead. No webhook, no certificates, no availability risk.
+
+      Use it to enforce a real supply-chain rule: in the `restricted-imgs`
+      namespace, every container image must come from an approved registry
+      and must not use the `:latest` tag.
+    docs:
+      - https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/
+      - https://kubernetes.io/docs/reference/using-api/cel/
+    tasks:
+      - text: "Create a ValidatingAdmissionPolicy `image-policy` that rejects any Pod with a container image using the `:latest` tag or no tag at all."
+      - text: "Bind it with a ValidatingAdmissionPolicyBinding `image-policy-binding` scoped to namespaces labelled `img-policy=on`, with validationActions `[Deny]`."
+      - text: "Label namespace `restricted-imgs` with `img-policy=on`."
+      - text: "Prove it: a pod using `nginx:latest` must be rejected, and one using `nginx:1.27-alpine` must be accepted (create it, named `ok-pod`)."
+    setup:
+      - kind: shell
+        desc: create the target namespace
+        run: |
+          kubectl create ns restricted-imgs
+          kubectl delete validatingadmissionpolicy image-policy --ignore-not-found
+          kubectl delete validatingadmissionpolicybinding image-policy-binding --ignore-not-found
+    verify:
+      - id: policy
+        desc: A ValidatingAdmissionPolicy image-policy exists targeting pods
+        points: 25
+        hint: "spec.matchConstraints.resourceRules for v1 pods, CREATE and UPDATE"
+        run: |
+          has validatingadmissionpolicy image-policy || exit 1
+          jp validatingadmissionpolicy image-policy '{.spec.matchConstraints.resourceRules[*].resources[*]}' \
+            | grep -q pods || exit 1
+          jp validatingadmissionpolicy image-policy '{.spec.validations[*].expression}' | grep -q 'image'
+      - id: binding
+        desc: A binding applies it to namespaces labelled img-policy=on, denying violations
+        points: 25
+        hint: "spec.matchResources.namespaceSelector plus validationActions: [Deny]"
+        run: |
+          eq "$(jp validatingadmissionpolicybinding image-policy-binding '{.spec.policyName}')" "image-policy" || exit 1
+          jp validatingadmissionpolicybinding image-policy-binding '{.spec.validationActions[*]}' | grep -q Deny || exit 1
+          jp validatingadmissionpolicybinding image-policy-binding \
+            '{.spec.matchResources.namespaceSelector.matchLabels.img-policy}' | grep -q on
+      - id: ns-labelled
+        desc: The restricted-imgs namespace opts into the policy
+        points: 10
+        hint: "kubectl label ns restricted-imgs img-policy=on"
+        run: |
+          eq "$(jp ns restricted-imgs '{.metadata.labels.img-policy}')" "on"
+      - id: rejects-latest
+        desc: A pod using nginx:latest is actually rejected
+        points: 25
+        hint: "test with kubectl run --dry-run=server"
+        run: |
+          out=$(kubectl -n restricted-imgs run klab-latest --image=nginx:latest \
+                  --restart=Never --dry-run=server 2>&1 || true)
+          echo "$out" | grep -Eqi 'denied|image-policy|forbidden'
+      - id: allows-pinned
+        desc: A pod with a pinned tag is accepted and Running
+        points: 15
+        hint: "the policy must not be so broad that nothing can be deployed"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n restricted-imgs get pod ok-pod -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: The policy object
+        cost: 14
+        text: |
+          ```yaml
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata:
+            name: image-policy
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: ["v1"]
+                  operations: ["CREATE", "UPDATE"]
+                  resources: ["pods"]
+            validations:
+              - expression: >
+                  object.spec.containers.all(c,
+                    !c.image.endsWith(':latest') && c.image.contains(':'))
+                message: "images must use an explicit, non-latest tag"
+          ```
+      - title: The binding
+        cost: 12
+        text: |
+          A policy does nothing until a binding activates it:
+
+          ```yaml
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata:
+            name: image-policy-binding
+          spec:
+            policyName: image-policy
+            validationActions: ["Deny"]
+            matchResources:
+              namespaceSelector:
+                matchLabels:
+                  img-policy: "on"
+          ```
+          `validationActions` can be `Deny`, `Warn`, `Audit`, or a
+          combination - the same dry-run-then-enforce migration path as PSA.
+      - title: Writing the CEL
+        cost: 12
+        text: |
+          `object` is the incoming resource. Useful pieces:
+
+          - `object.spec.containers.all(c, <expr>)` - every container must satisfy it
+          - `c.image.endsWith(':latest')`
+          - `c.image.contains(':')` - false means no tag, which implies latest
+          - `c.image.startsWith('registry.example.com/')` - registry allow-listing
+
+          Test quickly with `kubectl run ... --dry-run=server`.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      metadata:
+        name: image-policy
+      spec:
+        failurePolicy: Fail
+        matchConstraints:
+          resourceRules:
+            - apiGroups: [""]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE"]
+              resources: ["pods"]
+        validations:
+          - expression: "object.spec.containers.all(c, !c.image.endsWith(':latest') && c.image.contains(':'))"
+            message: "images must use an explicit, non-latest tag"
+      ---
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      metadata:
+        name: image-policy-binding
+      spec:
+        policyName: image-policy
+        validationActions: ["Deny"]
+        matchResources:
+          namespaceSelector:
+            matchLabels:
+              img-policy: "on"
+      YAML
+
+      kubectl label ns restricted-imgs img-policy=on
+
+      kubectl -n restricted-imgs run bad --image=nginx:latest --restart=Never   # denied
+      kubectl -n restricted-imgs run ok-pod --image=nginx:1.27-alpine --restart=Never
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      metadata:
+        name: image-policy
+      spec:
+        failurePolicy: Fail
+        matchConstraints:
+          resourceRules:
+            - apiGroups: [""]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE"]
+              resources: ["pods"]
+        validations:
+          - expression: "object.spec.containers.all(c, !c.image.endsWith(':latest') && c.image.contains(':'))"
+            message: "images must use an explicit, non-latest tag"
+      ---
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      metadata:
+        name: image-policy-binding
+      spec:
+        policyName: image-policy
+        validationActions: ["Deny"]
+        matchResources:
+          namespaceSelector:
+            matchLabels:
+              img-policy: "on"
+      YAML
+      kubectl label ns restricted-imgs img-policy=on --overwrite
+      sleep 12
+      kubectl -n restricted-imgs run ok-pod --image=nginx:1.27-alpine --restart=Never
+      kubectl -n restricted-imgs wait --for=condition=Ready pod/ok-pod --timeout=240s

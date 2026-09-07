@@ -1,0 +1,732 @@
+category: Supply Chain Security
+labs:
+
+  - id: sup-image-scanning
+    title: Scan images for vulnerabilities before they reach production
+    difficulty: hard
+    exams: [CKS, KCSA]
+    concepts: [trivy, cve, image scanning, supply chain, base images]
+    par_minutes: 16
+    estimated_minutes: 22
+    blurb: Run a real scanner against real images and act on what it finds.
+    scenario: |
+      A CKS question you should expect in some form: "scan these images and
+      delete/replace the ones with HIGH or CRITICAL vulnerabilities".
+
+      Trivy is the scanner the exam environment ships. The command you need
+      is short:
+
+      ```
+      trivy image --severity HIGH,CRITICAL --quiet <image>
+      trivy image --exit-code 1 --severity CRITICAL <image>
+      ```
+
+      `--exit-code 1` is the one that matters in CI: it makes the scanner
+      fail the build.
+
+      Three Deployments in `supply` run three images. Scan them, and replace
+      anything old and vulnerable with a current, minimal image.
+    docs:
+      - https://kubernetes.io/docs/concepts/security/security-checklist/
+      - https://kubernetes.io/docs/concepts/containers/images/
+    tasks:
+      - text: "Run a scan against the images used in the `supply` namespace (a trivy pod is provided, or use any scanner available to you)."
+      - text: "Replace the deliberately ancient image on Deployment `supply/legacy` with `nginx:1.27-alpine`."
+      - text: "Every container in `supply` must use an explicitly pinned tag - no `:latest`, no untagged images."
+      - text: "Record your finding in ConfigMap `scanreport` in `supply`: key `replaced` = the name of the Deployment you fixed, key `command` = the trivy flag that makes a scan fail a pipeline on findings."
+    setup:
+      - kind: shell
+        desc: deploy three workloads, one of them years out of date
+        timeout: 420
+        run: |
+          kubectl create ns supply
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: legacy, namespace: supply}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: legacy}}
+            template:
+              metadata: {labels: {app: legacy}}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.19.0
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: floating, namespace: supply}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: floating}}
+            template:
+              metadata: {labels: {app: floating}}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:latest
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: current, namespace: supply}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: current}}
+            template:
+              metadata: {labels: {app: current}}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.27-alpine
+          YAML
+          kubectl -n supply rollout status deploy/current --timeout=300s
+    verify:
+      - id: legacy-replaced
+        desc: The ancient image is gone from supply/legacy
+        points: 35
+        hint: "kubectl -n supply set image deploy/legacy web=nginx:1.27-alpine"
+        run: |
+          img=$(jp deploy legacy '{.spec.template.spec.containers[0].image}' -n supply)
+          eq "$img" "nginx:1.27-alpine"
+      - id: no-latest
+        desc: No container in the namespace uses :latest or an untagged image
+        points: 30
+        hint: "an image with no tag means latest, which means you do not know what is running"
+        run: |
+          imgs=$(kubectl -n supply get deploy \
+            -o jsonpath='{range .items[*]}{.spec.template.spec.containers[*].image}{"\n"}{end}')
+          [ -n "$imgs" ] || exit 1
+          for i in $imgs; do
+            case "$i" in
+              *:latest) exit 1 ;;
+              *:*) : ;;
+              *) exit 1 ;;
+            esac
+          done
+          exit 0
+      - id: healthy
+        desc: All three Deployments are running after your changes
+        points: 20
+        hint: "kubectl -n supply get deploy"
+        run: |
+          for d in legacy floating current; do
+            rollout supply deploy/$d 300s || exit 1
+          done
+      - id: report
+        desc: You recorded which Deployment you fixed and the CI-failing flag
+        points: 15
+        hint: "trivy image --exit-code 1 --severity CRITICAL <image>"
+        run: |
+          eq "$(jp cm scanreport '{.data.replaced}' -n supply | tr -d ' ')" "legacy" || exit 1
+          jp cm scanreport '{.data.command}' -n supply | grep -q 'exit-code'
+    hints:
+      - title: Running trivy in the cluster
+        cost: 10
+        text: |
+          If trivy is not on your PATH, run it as a pod:
+
+          ```
+          kubectl -n supply run trivy --rm -it --restart=Never \
+            --image=aquasec/trivy:0.56.2 -- \
+            image --severity HIGH,CRITICAL --quiet nginx:1.19.0
+          ```
+          The first run downloads the vulnerability database, so give it a
+          minute.
+      - title: Finding every image quickly
+        cost: 10
+        text: |
+          ```
+          kubectl -n supply get deploy \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[*].image}{"\n"}{end}'
+          ```
+          Cluster-wide, swap `-n supply` for `-A` and add `.metadata.namespace`.
+      - title: Why :latest is a security problem
+        cost: 10
+        text: |
+          `:latest` means two nodes can pull two different builds of "the
+          same" image, a rollback restores a tag rather than a build, and
+          nobody can say which code is running. Pin a tag, and pin a digest
+          (`nginx@sha256:...`) when you need it to be immutable.
+      - title: Fixing the workloads
+        cost: 8
+        text: |
+          ```
+          kubectl -n supply set image deploy/legacy web=nginx:1.27-alpine
+          kubectl -n supply set image deploy/floating web=nginx:1.27-alpine
+          kubectl -n supply rollout status deploy/legacy
+          ```
+    solution: |
+      ```bash
+      kubectl -n supply get deploy \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[*].image}{"\n"}{end}'
+
+      kubectl -n supply run trivy --rm -it --restart=Never \
+        --image=aquasec/trivy:0.56.2 -- \
+        image --severity HIGH,CRITICAL --quiet nginx:1.19.0
+
+      kubectl -n supply set image deploy/legacy web=nginx:1.27-alpine
+      kubectl -n supply set image deploy/floating web=nginx:1.27-alpine
+
+      kubectl -n supply create configmap scanreport \
+        --from-literal=replaced=legacy \
+        --from-literal=command='trivy image --exit-code 1 --severity CRITICAL'
+      ```
+    solve_script: |
+      kubectl -n supply set image deploy/legacy web=nginx:1.27-alpine
+      kubectl -n supply set image deploy/floating web=nginx:1.27-alpine
+      kubectl -n supply rollout status deploy/legacy --timeout=300s
+      kubectl -n supply rollout status deploy/floating --timeout=300s
+      kubectl -n supply create configmap scanreport \
+        --from-literal=replaced=legacy \
+        --from-literal=command='trivy image --exit-code 1 --severity CRITICAL'
+
+  - id: sup-minimal-images
+    title: Minimal base images and why distroless is not a gimmick
+    difficulty: medium
+    exams: [CKS, KCSA]
+    concepts: [distroless, attack surface, base images, shells, static binaries]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: Fewer binaries in the image means fewer things an attacker can run.
+    scenario: |
+      If your container has a shell, `curl`, a package manager and a
+      compiler, then so does anyone who gets code execution in it. Minimal
+      base images remove that toolkit.
+
+      Roughly, from largest to smallest:
+
+      - `ubuntu` / `debian` - a whole userland
+      - `alpine` - a few megabytes, still has `sh` and `apk`
+      - `gcr.io/distroless/*` - your binary, libc, CA certs; no shell
+      - `scratch` - literally nothing but your static binary
+
+      Migrate a workload down the ladder and observe what you lose.
+    docs:
+      - https://kubernetes.io/docs/concepts/containers/images/
+      - https://kubernetes.io/docs/concepts/security/security-checklist/#image-security
+    tasks:
+      - text: "In namespace `minimal`, change Deployment `app` from `ubuntu:22.04` to `registry.k8s.io/pause:3.9` - a 700KB static binary with no shell and no userland at all."
+      - text: "Clear the inherited `sleep 3600` command, since that binary does not exist in the new image."
+      - text: "The Deployment must run as a non-root user with a read-only root filesystem and all capabilities dropped."
+      - text: "Prove the hardening: `kubectl exec` into the pod with `sh` must fail, because there is no shell in the image."
+      - text: "Record in ConfigMap `imageinfo` in `minimal`: key `no_shell` = `true`, key `smallest_base` = `scratch`."
+    setup:
+      - kind: shell
+        desc: deploy a fat, root, writable container
+        timeout: 420
+        run: |
+          kubectl create ns minimal
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: app, namespace: minimal}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: app}}
+            template:
+              metadata: {labels: {app: app}}
+              spec:
+                containers:
+                  - name: c
+                    image: ubuntu:22.04
+                    command: ["sleep", "3600"]
+          YAML
+          kubectl -n minimal rollout status deploy/app --timeout=300s
+    verify:
+      - id: image
+        desc: The Deployment runs a shell-less minimal image
+        points: 30
+        hint: "registry.k8s.io/pause:3.9 is a static binary with no shell and no userland"
+        run: |
+          img=$(jp deploy app '{.spec.template.spec.containers[0].image}' -n minimal)
+          echo "$img" | grep -Eq 'pause|distroless|scratch' || exit 1
+          ! echo "$img" | grep -q 'ubuntu'
+      - id: hardened
+        desc: It runs non-root, read-only, with no capabilities
+        points: 30
+        hint: "runAsNonRoot on the pod; readOnlyRootFilesystem and capabilities on the container"
+        run: |
+          eq "$(jp deploy app '{.spec.template.spec.securityContext.runAsNonRoot}' -n minimal)" "true" || exit 1
+          c='.spec.template.spec.containers[0].securityContext'
+          eq "$(jp deploy app "{$c.readOnlyRootFilesystem}" -n minimal)" "true" || exit 1
+          jp deploy app "{$c.capabilities.drop[*]}" -n minimal | grep -q ALL
+      - id: running
+        desc: It is still running after the change
+        points: 20
+        hint: "kubectl -n minimal rollout status deploy/app"
+        run: |
+          rollout minimal deploy/app 300s
+      - id: no-shell
+        desc: There really is no shell to exec into
+        points: 20
+        hint: "kubectl -n minimal exec deploy/app -- sh should fail"
+        run: |
+          pod=$(kubectl -n minimal get pods -l app=app -o name | head -1)
+          [ -n "$pod" ] || exit 1
+          if kubectl -n minimal exec "$pod" -- sh -c 'echo hi' >/dev/null 2>&1; then
+            echo "a shell is still available in the image" >&2
+            exit 1
+          fi
+          eq "$(jp cm imageinfo '{.data.no_shell}' -n minimal | tr -d ' ')" "true" || exit 1
+          eq "$(jp cm imageinfo '{.data.smallest_base}' -n minimal | tr -d ' ')" "scratch"
+    hints:
+      - title: The replacement workload
+        cost: 12
+        text: |
+          ```
+          kubectl -n minimal patch deploy app --type=strategic -p '
+          spec:
+            template:
+              spec:
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 65532
+                containers:
+                  - name: c
+                    image: registry.k8s.io/pause:3.9
+                    command: null
+                    args: null
+                    securityContext:
+                      readOnlyRootFilesystem: true
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: ["ALL"]
+          '
+          ```
+          `command: null` clears the inherited `sleep 3600`, which does not
+          exist in the pause image.
+      - title: How you debug a shell-less container
+        cost: 10
+        text: |
+          You do not exec into it - you attach a debug container that has
+          the tools, sharing the target's namespaces:
+
+          ```
+          kubectl -n minimal debug -it <pod> --image=busybox:1.36 --target=c
+          ```
+          This is why `kubectl debug` and distroless images go together.
+      - title: The trade-off to be able to state
+        cost: 10
+        text: |
+          Minimal images give you a smaller attack surface, faster pulls and
+          fewer CVEs to triage. They cost you easy debugging and they need
+          statically linked or carefully built binaries. The industry answer
+          is: ship minimal, debug with ephemeral containers.
+    solution: |
+      ```bash
+      kubectl -n minimal patch deploy app --type=strategic -p '{"spec":{"template":{"spec":{
+        "securityContext":{"runAsNonRoot":true,"runAsUser":65532},
+        "containers":[{"name":"c","image":"registry.k8s.io/pause:3.9",
+          "command":null,"args":null,
+          "securityContext":{"readOnlyRootFilesystem":true,
+            "allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+
+      kubectl -n minimal rollout status deploy/app
+      kubectl -n minimal exec deploy/app -- sh          # fails: no shell
+
+      kubectl -n minimal create configmap imageinfo \
+        --from-literal=no_shell=true --from-literal=smallest_base=scratch
+      ```
+    solve_script: |
+      kubectl -n minimal patch deploy app --type=strategic -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65532},"containers":[{"name":"c","image":"registry.k8s.io/pause:3.9","command":null,"args":null,"securityContext":{"readOnlyRootFilesystem":true,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+      kubectl -n minimal rollout status deploy/app --timeout=300s
+      kubectl -n minimal create configmap imageinfo \
+        --from-literal=no_shell=true --from-literal=smallest_base=scratch
+
+  - id: sup-registry-allowlist
+    title: Allow images only from registries you trust
+    difficulty: hard
+    exams: [CKS]
+    concepts: [admission control, image provenance, registry allowlist, CEL, governance]
+    par_minutes: 17
+    estimated_minutes: 22
+    blurb: Stop anyone pulling arbitrary code from the internet into your cluster.
+    scenario: |
+      "Anyone can run any image from anywhere" is the default, and it is the
+      widest supply-chain hole most clusters have. A single mistyped image
+      name is enough to run someone else's code inside your network.
+
+      Enforce a registry allowlist at admission time. Only images from
+      `registry.k8s.io/` and `docker.io/library/` may be deployed into the
+      `trusted` namespace.
+
+      Use a `ValidatingAdmissionPolicy` so there is no webhook to run and no
+      certificate to rotate.
+    docs:
+      - https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/
+      - https://kubernetes.io/docs/concepts/containers/images/#image-names
+    tasks:
+      - text: "Create a ValidatingAdmissionPolicy `registry-allowlist` that only permits pod images starting with `registry.k8s.io/` or `docker.io/library/`."
+      - text: "Bind it with `registry-allowlist-binding`, denying violations, scoped to namespaces labelled `trusted=yes`."
+      - text: "Label namespace `trusted` accordingly."
+      - text: "Prove it: a pod using `evil.example.com/malware:1` must be rejected, and a pod named `allowed` using `registry.k8s.io/pause:3.9` must run."
+    setup:
+      - kind: shell
+        desc: create the trusted namespace
+        run: |
+          kubectl create ns trusted
+          kubectl delete validatingadmissionpolicy registry-allowlist --ignore-not-found
+          kubectl delete validatingadmissionpolicybinding registry-allowlist-binding --ignore-not-found
+    verify:
+      - id: policy
+        desc: A ValidatingAdmissionPolicy registry-allowlist exists for pods
+        points: 25
+        hint: "matchConstraints on v1 pods, CREATE and UPDATE"
+        run: |
+          has validatingadmissionpolicy registry-allowlist || exit 1
+          jp validatingadmissionpolicy registry-allowlist \
+            '{.spec.matchConstraints.resourceRules[*].resources[*]}' | grep -q pods || exit 1
+          jp validatingadmissionpolicy registry-allowlist '{.spec.validations[*].expression}' \
+            | grep -q 'registry.k8s.io'
+      - id: binding
+        desc: The binding denies violations in namespaces labelled trusted=yes
+        points: 25
+        hint: "validationActions: [Deny] plus a namespaceSelector"
+        run: |
+          eq "$(jp validatingadmissionpolicybinding registry-allowlist-binding '{.spec.policyName}')" "registry-allowlist" || exit 1
+          jp validatingadmissionpolicybinding registry-allowlist-binding '{.spec.validationActions[*]}' | grep -q Deny || exit 1
+          jp validatingadmissionpolicybinding registry-allowlist-binding \
+            '{.spec.matchResources.namespaceSelector.matchLabels.trusted}' | grep -q yes
+      - id: labelled
+        desc: The trusted namespace opts in
+        points: 10
+        hint: "kubectl label ns trusted trusted=yes"
+        run: |
+          eq "$(jp ns trusted '{.metadata.labels.trusted}')" "yes"
+      - id: blocks-untrusted
+        desc: An image from an unapproved registry is rejected
+        points: 25
+        hint: "test with --dry-run=server so nothing is actually created"
+        run: |
+          out=$(kubectl -n trusted run klab-evil --image=evil.example.com/malware:1 \
+                  --restart=Never --dry-run=server 2>&1 || true)
+          echo "$out" | grep -Eqi 'denied|registry-allowlist|forbidden'
+      - id: allows-trusted
+        desc: An approved image still runs
+        points: 15
+        hint: "a policy that blocks everything is not a policy, it is an outage"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n trusted get pod allowed -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: The CEL expression
+        cost: 12
+        text: |
+          ```
+          object.spec.containers.all(c,
+            c.image.startsWith('registry.k8s.io/') ||
+            c.image.startsWith('docker.io/library/'))
+          ```
+          Careful: `nginx:1.27-alpine` does **not** start with
+          `docker.io/library/` as far as CEL is concerned - the API server
+          stores the image string exactly as written. That is why the
+          allowed test pod uses a fully qualified `registry.k8s.io` image.
+      - title: The full policy
+        cost: 12
+        text: |
+          ```yaml
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata:
+            name: registry-allowlist
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: ["v1"]
+                  operations: ["CREATE", "UPDATE"]
+                  resources: ["pods"]
+            validations:
+              - expression: >
+                  object.spec.containers.all(c,
+                    c.image.startsWith('registry.k8s.io/') ||
+                    c.image.startsWith('docker.io/library/'))
+                message: "images must come from an approved registry"
+          ```
+      - title: Do not forget init containers
+        cost: 10
+        text: |
+          A real allowlist has to cover `initContainers` and
+          `ephemeralContainers` too, or an attacker just puts their image
+          there. Add:
+
+          ```
+          && object.spec.?initContainers.orValue([]).all(c, ...)
+          ```
+          The lab only checks `containers`, but the exam may not be so kind.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      metadata:
+        name: registry-allowlist
+      spec:
+        failurePolicy: Fail
+        matchConstraints:
+          resourceRules:
+            - apiGroups: [""]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE"]
+              resources: ["pods"]
+        validations:
+          - expression: "object.spec.containers.all(c, c.image.startsWith('registry.k8s.io/') || c.image.startsWith('docker.io/library/'))"
+            message: "images must come from an approved registry"
+      ---
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      metadata:
+        name: registry-allowlist-binding
+      spec:
+        policyName: registry-allowlist
+        validationActions: ["Deny"]
+        matchResources:
+          namespaceSelector:
+            matchLabels:
+              trusted: "yes"
+      YAML
+
+      kubectl label ns trusted trusted=yes
+
+      kubectl -n trusted run bad --image=evil.example.com/malware:1 --restart=Never  # denied
+      kubectl -n trusted run allowed --image=registry.k8s.io/pause:3.9 --restart=Never
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      metadata:
+        name: registry-allowlist
+      spec:
+        failurePolicy: Fail
+        matchConstraints:
+          resourceRules:
+            - apiGroups: [""]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE"]
+              resources: ["pods"]
+        validations:
+          - expression: "object.spec.containers.all(c, c.image.startsWith('registry.k8s.io/') || c.image.startsWith('docker.io/library/'))"
+            message: "images must come from an approved registry"
+      ---
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      metadata:
+        name: registry-allowlist-binding
+      spec:
+        policyName: registry-allowlist
+        validationActions: ["Deny"]
+        matchResources:
+          namespaceSelector:
+            matchLabels:
+              trusted: "yes"
+      YAML
+      kubectl label ns trusted trusted=yes --overwrite
+      sleep 12
+      kubectl -n trusted run allowed --image=registry.k8s.io/pause:3.9 --restart=Never
+      kubectl -n trusted wait --for=condition=Ready pod/allowed --timeout=240s
+
+  - id: sup-static-analysis
+    title: Review manifests before they ship
+    difficulty: medium
+    exams: [CKS, KCSA]
+    concepts: [static analysis, manifest review, kubesec, security checklist]
+    par_minutes: 15
+    estimated_minutes: 19
+    blurb: Read a manifest like a reviewer and fix everything wrong with it.
+    scenario: |
+      Half of CKS is really "can you read a manifest and see what is wrong
+      with it". Tools like kubesec and checkov automate it, but the exam
+      wants your eyes.
+
+      There is one Deployment in `review` containing a stack of bad
+      practices. Fix every one of them without breaking the workload:
+
+      - runs as root
+      - privileged
+      - allows privilege escalation
+      - mounts the host `/etc` directory
+      - uses the `default` ServiceAccount with a token mounted
+      - has no resource limits
+      - uses a floating `:latest` tag
+    docs:
+      - https://kubernetes.io/docs/concepts/security/security-checklist/
+      - https://kubernetes.io/docs/concepts/security/pod-security-standards/
+    tasks:
+      - text: "Remove the privileged flag and set `allowPrivilegeEscalation: false`."
+      - text: "Make it run as non-root (`runAsNonRoot: true`, `runAsUser: 101`) with all capabilities dropped."
+      - text: "Remove the hostPath mount of `/etc` entirely."
+      - text: "Stop mounting a ServiceAccount token (`automountServiceAccountToken: false`)."
+      - text: "Add CPU and memory requests and limits, and pin the image to `nginxinc/nginx-unprivileged:1.27-alpine`."
+      - text: "The Deployment must still roll out successfully."
+    setup:
+      - kind: shell
+        desc: deploy a manifest that fails every review
+        timeout: 420
+        run: |
+          kubectl create ns review
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: legacy-app, namespace: review}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: legacy-app}}
+            template:
+              metadata: {labels: {app: legacy-app}}
+              spec:
+                volumes:
+                  - name: hostetc
+                    hostPath: {path: /etc}
+                containers:
+                  - name: web
+                    image: nginx:latest
+                    securityContext:
+                      privileged: true
+                      allowPrivilegeEscalation: true
+                    volumeMounts:
+                      - {name: hostetc, mountPath: /hostetc}
+          YAML
+          kubectl -n review rollout status deploy/legacy-app --timeout=300s
+    verify:
+      - id: not-privileged
+        desc: The container is no longer privileged and cannot escalate
+        points: 25
+        hint: "privileged must be false or absent; allowPrivilegeEscalation must be false"
+        run: |
+          c='.spec.template.spec.containers[0].securityContext'
+          p=$(jp deploy legacy-app "{$c.privileged}" -n review)
+          [ "$p" != "true" ] || exit 1
+          eq "$(jp deploy legacy-app "{$c.allowPrivilegeEscalation}" -n review)" "false"
+      - id: nonroot
+        desc: It runs as a non-root user with all capabilities dropped
+        points: 20
+        hint: "runAsNonRoot goes on the pod securityContext"
+        run: |
+          eq "$(jp deploy legacy-app '{.spec.template.spec.securityContext.runAsNonRoot}' -n review)" "true" || exit 1
+          jp deploy legacy-app '{.spec.template.spec.containers[0].securityContext.capabilities.drop[*]}' -n review \
+            | grep -q ALL
+      - id: no-hostpath
+        desc: The host /etc mount is gone
+        points: 20
+        hint: "remove both the volume and its volumeMount"
+        run: |
+          ! jp deploy legacy-app '{.spec.template.spec.volumes[*].hostPath.path}' -n review | grep -q '/etc'
+      - id: no-token
+        desc: No ServiceAccount token is mounted
+        points: 10
+        hint: "automountServiceAccountToken: false on the pod spec"
+        run: |
+          eq "$(jp deploy legacy-app '{.spec.template.spec.automountServiceAccountToken}' -n review)" "false"
+      - id: resources-and-tag
+        desc: Resources are set and the image is pinned
+        points: 15
+        hint: "kubectl -n review set resources deploy/legacy-app --requests=... --limits=..."
+        run: |
+          r='.spec.template.spec.containers[0].resources'
+          jp deploy legacy-app "{$r.requests.cpu}" -n review | grep -q . || exit 1
+          jp deploy legacy-app "{$r.limits.memory}" -n review | grep -q . || exit 1
+          img=$(jp deploy legacy-app '{.spec.template.spec.containers[0].image}' -n review)
+          echo "$img" | grep -q 'nginx-unprivileged:1.27-alpine'
+      - id: still-runs
+        desc: The hardened Deployment still rolls out
+        points: 10
+        hint: "hardening that breaks the app is not hardening"
+        run: |
+          rollout review deploy/legacy-app 300s
+    hints:
+      - title: Review it as a whole first
+        cost: 8
+        text: |
+          ```
+          kubectl -n review get deploy legacy-app -o yaml > app.yaml
+          ```
+          Read it top to bottom against the checklist: identity, privileges,
+          capabilities, host access, network, secrets, resources, image.
+          That order will serve you in the exam.
+      - title: Rewriting rather than patching
+        cost: 10
+        text: |
+          Removing a volume with a strategic merge patch is awkward. It is
+          faster and clearer to apply a clean replacement manifest with
+          `kubectl apply -f` - the Deployment name stays the same, so it is
+          an update, not a recreate.
+      - title: The finished pod spec
+        cost: 12
+        text: |
+          ```yaml
+          spec:
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 101
+              seccompProfile: {type: RuntimeDefault}
+            containers:
+              - name: web
+                image: nginxinc/nginx-unprivileged:1.27-alpine
+                resources:
+                  requests: {cpu: 50m, memory: 64Mi}
+                  limits: {cpu: 200m, memory: 128Mi}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities: {drop: ["ALL"]}
+          ```
+          No volumes, no host paths, no privileged flag.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: legacy-app, namespace: review}
+      spec:
+        replicas: 1
+        selector: {matchLabels: {app: legacy-app}}
+        template:
+          metadata: {labels: {app: legacy-app}}
+          spec:
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 101
+              seccompProfile: {type: RuntimeDefault}
+            containers:
+              - name: web
+                image: nginxinc/nginx-unprivileged:1.27-alpine
+                resources:
+                  requests: {cpu: 50m, memory: 64Mi}
+                  limits: {cpu: 200m, memory: 128Mi}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities: {drop: ["ALL"]}
+      YAML
+
+      kubectl -n review rollout status deploy/legacy-app
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: legacy-app, namespace: review}
+      spec:
+        replicas: 1
+        selector: {matchLabels: {app: legacy-app}}
+        template:
+          metadata: {labels: {app: legacy-app}}
+          spec:
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 101
+              seccompProfile: {type: RuntimeDefault}
+            containers:
+              - name: web
+                image: nginxinc/nginx-unprivileged:1.27-alpine
+                resources:
+                  requests: {cpu: 50m, memory: 64Mi}
+                  limits: {cpu: 200m, memory: 128Mi}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities: {drop: ["ALL"]}
+      YAML
+      kubectl -n review rollout status deploy/legacy-app --timeout=300s

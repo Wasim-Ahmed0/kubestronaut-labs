@@ -1,0 +1,858 @@
+category: Storage
+labs:
+
+  - id: store-volume-types
+    title: emptyDir, hostPath and where container data really goes
+    difficulty: easy
+    exams: [KCNA, CKAD]
+    concepts: [volumes, emptyDir, hostPath, ephemeral storage]
+    par_minutes: 10
+    estimated_minutes: 13
+    blurb: Prove to yourself what survives a container restart and what does not.
+    scenario: |
+      A container's filesystem is thrown away when the container restarts.
+      An `emptyDir` survives container restarts but dies with the pod. A
+      `hostPath` outlives the pod entirely but ties you to one node and is a
+      security problem in production.
+
+      Build a pod that demonstrates the difference, and write down what you
+      observe.
+    docs:
+      - https://kubernetes.io/docs/concepts/storage/volumes/
+    tasks:
+      - text: "In namespace `vol`, create a Pod `scratch` (`busybox:1.36`, `sleep 3600`) with an `emptyDir` volume `cache` mounted at `/cache`."
+      - text: "Also mount a `hostPath` volume `hostdata` with path `/tmp/klab-hostdata` and type `DirectoryOrCreate` at `/hostdata`."
+      - text: "Write the text `hello` into `/cache/file` and into `/hostdata/file` from inside the pod."
+      - text: "Create a ConfigMap `volanswers` in `vol` with key `survives_pod_delete` set to `hostPath`."
+    setup:
+      - kind: shell
+        desc: create the vol namespace
+        run: kubectl create ns vol
+    verify:
+      - id: volumes
+        desc: The pod declares both an emptyDir and a hostPath volume
+        points: 30
+        hint: "two entries under spec.volumes, one emptyDir and one hostPath"
+        run: |
+          jp pod scratch '{.spec.volumes[?(@.name=="cache")].emptyDir}' -n vol | grep -q '{' || exit 1
+          eq "$(jp pod scratch '{.spec.volumes[?(@.name=="hostdata")].hostPath.path}' -n vol)" "/tmp/klab-hostdata"
+      - id: mounts
+        desc: They are mounted at /cache and /hostdata
+        points: 25
+        hint: "volumeMounts on the container, matching the volume names"
+        run: |
+          m=$(jp pod scratch '{.spec.containers[0].volumeMounts[*].mountPath}' -n vol)
+          echo "$m" | grep -q '/cache' && echo "$m" | grep -q '/hostdata'
+      - id: written
+        desc: Both files contain hello
+        points: 30
+        hint: "kubectl -n vol exec scratch -- sh -c 'echo hello > /cache/file'"
+        run: |
+          retry bash -c 'kubectl -n vol get pod scratch -o jsonpath="{.status.phase}" | grep -q Running'
+          kubectl -n vol exec scratch -- cat /cache/file 2>/dev/null | grep -q hello || exit 1
+          kubectl -n vol exec scratch -- cat /hostdata/file 2>/dev/null | grep -q hello
+      - id: answer
+        desc: You recorded which volume type outlives the pod
+        points: 15
+        hint: "an emptyDir is deleted with the pod; a hostPath is a directory on the node"
+        run: |
+          eq "$(jp cm volanswers '{.data.survives_pod_delete}' -n vol | tr -d ' ')" "hostPath"
+    hints:
+      - title: The manifest
+        cost: 8
+        text: |
+          ```yaml
+          spec:
+            volumes:
+              - name: cache
+                emptyDir: {}
+              - name: hostdata
+                hostPath:
+                  path: /tmp/klab-hostdata
+                  type: DirectoryOrCreate
+          ```
+          `DirectoryOrCreate` makes the kubelet create the directory if it
+          is missing, instead of failing to start the pod.
+      - title: Writing into the pod
+        cost: 6
+        text: |
+          ```
+          kubectl -n vol exec scratch -- sh -c 'echo hello > /cache/file'
+          kubectl -n vol exec scratch -- sh -c 'echo hello > /hostdata/file'
+          ```
+      - title: Seeing it on the node
+        cost: 8
+        text: |
+          The hostPath file is a real file on the node:
+
+          ```
+          knode kubestronaut-control-plane cat /tmp/klab-hostdata/file
+          ```
+          That is exactly why hostPath is dangerous - a pod that can mount
+          it can read and write the node's filesystem.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: scratch, namespace: vol}
+      spec:
+        volumes:
+          - name: cache
+            emptyDir: {}
+          - name: hostdata
+            hostPath:
+              path: /tmp/klab-hostdata
+              type: DirectoryOrCreate
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts:
+              - {name: cache, mountPath: /cache}
+              - {name: hostdata, mountPath: /hostdata}
+      YAML
+
+      kubectl -n vol wait --for=condition=Ready pod/scratch
+      kubectl -n vol exec scratch -- sh -c 'echo hello > /cache/file'
+      kubectl -n vol exec scratch -- sh -c 'echo hello > /hostdata/file'
+
+      kubectl -n vol create configmap volanswers --from-literal=survives_pod_delete=hostPath
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: scratch, namespace: vol}
+      spec:
+        volumes:
+          - name: cache
+            emptyDir: {}
+          - name: hostdata
+            hostPath: {path: /tmp/klab-hostdata, type: DirectoryOrCreate}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts:
+              - {name: cache, mountPath: /cache}
+              - {name: hostdata, mountPath: /hostdata}
+      YAML
+      kubectl -n vol wait --for=condition=Ready pod/scratch --timeout=180s
+      kubectl -n vol exec scratch -- sh -c 'echo hello > /cache/file'
+      kubectl -n vol exec scratch -- sh -c 'echo hello > /hostdata/file'
+      kubectl -n vol create configmap volanswers --from-literal=survives_pod_delete=hostPath
+
+  - id: store-pv-pvc-static
+    title: Static provisioning - bind a PVC to a PV you made yourself
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [persistentvolume, persistentvolumeclaim, binding, access modes]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: The manual half of Kubernetes storage, and the rules that decide what binds.
+    scenario: |
+      Before dynamic provisioning, an admin created PersistentVolumes by
+      hand and users claimed them. That flow is still on the CKA, and it is
+      still how you debug a claim that will not bind.
+
+      A PVC binds to a PV only if **all** of these line up: the storage
+      class name, the access modes, and a capacity at least as large as
+      requested.
+
+      Create a matching pair, get them Bound, and mount the result.
+    docs:
+      - https://kubernetes.io/docs/concepts/storage/persistent-volumes/
+    tasks:
+      - text: "Create a PersistentVolume `pv-manual`: 1Gi, accessMode ReadWriteOnce, storageClassName `manual`, hostPath `/tmp/klab-pv`, reclaim policy Retain."
+      - text: "Create a PersistentVolumeClaim `pvc-manual` in namespace `storage`: 500Mi, ReadWriteOnce, storageClassName `manual`."
+      - text: "The claim must reach `Bound` against your PV."
+      - text: "Create a Pod `writer` in `storage` (`busybox:1.36`, `sleep 3600`) that mounts the claim at `/data`."
+    setup:
+      - kind: shell
+        desc: create the storage namespace
+        run: kubectl create ns storage
+    verify:
+      - id: pv
+        desc: PV pv-manual has the required size, class and reclaim policy
+        points: 25
+        hint: "PVs are cluster-scoped -- no namespace"
+        run: |
+          eq "$(jp pv pv-manual '{.spec.capacity.storage}')" "1Gi" || exit 1
+          eq "$(jp pv pv-manual '{.spec.storageClassName}')" "manual" || exit 1
+          eq "$(jp pv pv-manual '{.spec.persistentVolumeReclaimPolicy}')" "Retain" || exit 1
+          jp pv pv-manual '{.spec.accessModes[*]}' | grep -q ReadWriteOnce
+      - id: pvc
+        desc: PVC storage/pvc-manual requests 500Mi of class manual
+        points: 20
+        hint: "storageClassName must match the PV exactly"
+        run: |
+          eq "$(jp pvc pvc-manual '{.spec.storageClassName}' -n storage)" "manual" || exit 1
+          eq "$(jp pvc pvc-manual '{.spec.resources.requests.storage}' -n storage)" "500Mi"
+      - id: bound
+        desc: The claim is Bound to pv-manual
+        points: 30
+        hint: "kubectl get pv,pvc -- if it stays Pending, compare class, access mode and size"
+        run: |
+          RETRY=20 retry bash -c '[ "$(kubectl -n storage get pvc pvc-manual -o jsonpath="{.status.phase}")" = "Bound" ]' || exit 1
+          eq "$(jp pvc pvc-manual '{.spec.volumeName}' -n storage)" "pv-manual"
+      - id: mounted
+        desc: Pod storage/writer mounts the claim at /data and is Running
+        points: 25
+        hint: "volumes: [{name: d, persistentVolumeClaim: {claimName: pvc-manual}}]"
+        run: |
+          eq "$(jp pod writer '{.spec.volumes[0].persistentVolumeClaim.claimName}' -n storage)" "pvc-manual" || exit 1
+          jp pod writer '{.spec.containers[0].volumeMounts[*].mountPath}' -n storage | grep -q '/data' || exit 1
+          RETRY=25 retry bash -c '[ "$(kubectl -n storage get pod writer -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: The PV
+        cost: 10
+        text: |
+          ```yaml
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: pv-manual
+          spec:
+            capacity:
+              storage: 1Gi
+            accessModes: ["ReadWriteOnce"]
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: manual
+            hostPath:
+              path: /tmp/klab-pv
+          ```
+      - title: Why a claim stays Pending
+        cost: 10
+        text: |
+          `kubectl -n storage describe pvc pvc-manual` names the reason. The
+          usual causes:
+
+          - storageClassName differs (including "" versus unset)
+          - the PV is smaller than the request
+          - access modes do not overlap
+          - the PV is already Bound to something else
+      - title: Mounting a claim
+        cost: 8
+        text: |
+          ```yaml
+          spec:
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: pvc-manual
+            containers:
+              - name: c
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+          ```
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata: {name: pv-manual}
+      spec:
+        capacity: {storage: 1Gi}
+        accessModes: ["ReadWriteOnce"]
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: manual
+        hostPath: {path: /tmp/klab-pv}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: pvc-manual, namespace: storage}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: manual
+        resources:
+          requests: {storage: 500Mi}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: writer, namespace: storage}
+      spec:
+        volumes:
+          - name: data
+            persistentVolumeClaim: {claimName: pvc-manual}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts:
+              - {name: data, mountPath: /data}
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata: {name: pv-manual}
+      spec:
+        capacity: {storage: 1Gi}
+        accessModes: ["ReadWriteOnce"]
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: manual
+        hostPath: {path: /tmp/klab-pv}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: pvc-manual, namespace: storage}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: manual
+        resources:
+          requests: {storage: 500Mi}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: writer, namespace: storage}
+      spec:
+        volumes:
+          - name: data
+            persistentVolumeClaim: {claimName: pvc-manual}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts: [{name: data, mountPath: /data}]
+      YAML
+      kubectl -n storage wait --for=condition=Ready pod/writer --timeout=180s
+
+  - id: store-dynamic-provisioning
+    title: Dynamic provisioning and WaitForFirstConsumer
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [storageclass, dynamic provisioning, volumeBindingMode, default class]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Why a perfectly correct PVC sits Pending until a pod wants it.
+    scenario: |
+      This cluster has a default StorageClass. When you create a PVC without
+      naming a class, the default provisioner creates a PV for you - no
+      admin involved.
+
+      But the default class here uses `volumeBindingMode:
+      WaitForFirstConsumer`, which deliberately leaves the claim `Pending`
+      until a pod actually schedules. That is not a bug: it lets the
+      scheduler pick a node first and then put the volume there.
+
+      Meet it deliberately so it never confuses you under exam pressure.
+    docs:
+      - https://kubernetes.io/docs/concepts/storage/storage-classes/
+      - https://kubernetes.io/docs/concepts/storage/persistent-volumes/#claims-as-volumes
+    tasks:
+      - text: "Record the name of the cluster's default StorageClass in a ConfigMap `scinfo` in `dyn`, key `default`."
+      - text: "Record its volumeBindingMode under key `mode`."
+      - text: "Create a PVC `app-data` in `dyn` requesting 200Mi with no storageClassName (so it uses the default)."
+      - text: "Create a Deployment `app` in `dyn` (1 replica, `busybox:1.36`, `sleep 3600`) that mounts `app-data` at `/data`."
+      - text: "The PVC must end up Bound and the pod Running."
+    setup:
+      - kind: shell
+        desc: create the dyn namespace
+        run: kubectl create ns dyn
+    verify:
+      - id: default-class
+        desc: The recorded default StorageClass is correct
+        points: 20
+        hint: "kubectl get sc -- the default is marked (default)"
+        run: |
+          want=$(kubectl get sc -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{end}')
+          got=$(jp cm scinfo '{.data.default}' -n dyn | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: mode
+        desc: The recorded volumeBindingMode is correct
+        points: 20
+        hint: "kubectl get sc <name> -o jsonpath='{.volumeBindingMode}'"
+        run: |
+          sc=$(jp cm scinfo '{.data.default}' -n dyn | tr -d ' ')
+          [ -n "$sc" ] || exit 1
+          want=$(kubectl get sc "$sc" -o jsonpath='{.volumeBindingMode}')
+          got=$(jp cm scinfo '{.data.mode}' -n dyn | tr -d ' ')
+          eq "$got" "$want"
+      - id: pvc
+        desc: PVC dyn/app-data requests 200Mi and uses the default class
+        points: 25
+        hint: "leave storageClassName out entirely -- do not set it to empty string"
+        run: |
+          eq "$(jp pvc app-data '{.spec.resources.requests.storage}' -n dyn)" "200Mi" || exit 1
+          sc=$(jp pvc app-data '{.spec.storageClassName}' -n dyn)
+          def=$(kubectl get sc -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{end}')
+          eq "$sc" "$def"
+      - id: bound
+        desc: The PVC is Bound once the pod schedules
+        points: 20
+        hint: "it stays Pending until a consumer exists -- that is WaitForFirstConsumer"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n dyn get pvc app-data -o jsonpath="{.status.phase}")" = "Bound" ]'
+      - id: running
+        desc: The app Deployment is running with the volume mounted at /data
+        points: 15
+        hint: "kubectl -n dyn rollout status deploy/app"
+        run: |
+          rollout dyn deploy/app 180s || exit 1
+          jp deploy app '{.spec.template.spec.containers[0].volumeMounts[*].mountPath}' -n dyn | grep -q '/data'
+    hints:
+      - title: Finding the default class
+        cost: 8
+        text: |
+          ```
+          kubectl get sc
+          ```
+          The default is annotated
+          `storageclass.kubernetes.io/is-default-class: "true"`. On kind it
+          is `standard`, backed by the local-path provisioner.
+      - title: A PVC with no class
+        cost: 8
+        text: |
+          ```yaml
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: app-data, namespace: dyn}
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 200Mi
+          ```
+          Omitting `storageClassName` means "use the default".
+          `storageClassName: ""` means "no class at all" - very different.
+      - title: Mounting it from a Deployment
+        cost: 10
+        text: |
+          Generate the Deployment, then add the volume:
+
+          ```
+          kubectl -n dyn create deployment app --image=busybox:1.36 $do \
+            -- sleep 3600 > app.yaml
+          ```
+          then add `volumes` with `persistentVolumeClaim.claimName: app-data`
+          and a matching `volumeMounts` entry.
+    solution: |
+      ```bash
+      SC=$(kubectl get sc -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{end}')
+      MODE=$(kubectl get sc "$SC" -o jsonpath='{.volumeBindingMode}')
+      kubectl -n dyn create configmap scinfo \
+        --from-literal=default=$SC --from-literal=mode=$MODE
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: app-data, namespace: dyn}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 200Mi}
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: app, namespace: dyn}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels: {app: app}
+        template:
+          metadata:
+            labels: {app: app}
+          spec:
+            volumes:
+              - name: data
+                persistentVolumeClaim: {claimName: app-data}
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - {name: data, mountPath: /data}
+      YAML
+      ```
+    solve_script: |
+      SC=$(kubectl get sc -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{end}')
+      MODE=$(kubectl get sc "$SC" -o jsonpath='{.volumeBindingMode}')
+      kubectl -n dyn create configmap scinfo --from-literal=default=$SC --from-literal=mode=$MODE
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: app-data, namespace: dyn}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 200Mi}
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: app, namespace: dyn}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels: {app: app}
+        template:
+          metadata:
+            labels: {app: app}
+          spec:
+            volumes:
+              - name: data
+                persistentVolumeClaim: {claimName: app-data}
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                volumeMounts: [{name: data, mountPath: /data}]
+      YAML
+      kubectl -n dyn rollout status deploy/app --timeout=240s
+
+  - id: store-pvc-troubleshoot
+    title: Fix three PVCs that will not bind
+    difficulty: hard
+    exams: [CKA]
+    concepts: [persistentvolumeclaim, troubleshooting, binding, access modes]
+    par_minutes: 15
+    estimated_minutes: 20
+    blurb: Class mismatch, size mismatch, access-mode mismatch - the whole trio.
+    scenario: |
+      Three PVCs in the `broken` namespace are stuck `Pending`, and there
+      are three PVs sitting `Available` that were clearly meant for them.
+      Each pairing fails for a different reason.
+
+      You may edit the **claims** but not the PersistentVolumes - treat the
+      PVs as pre-provisioned storage handed to you by an infrastructure team.
+
+      Note that most of a PVC's spec is immutable, so "edit the claim" in
+      practice means delete and recreate it.
+    docs:
+      - https://kubernetes.io/docs/concepts/storage/persistent-volumes/#binding
+    tasks:
+      - text: "Get all three PVCs in `broken` to `Bound`."
+      - text: "Do not modify or delete the PersistentVolumes."
+      - text: "`claim-a` must bind to `pv-a`, `claim-b` to `pv-b`, `claim-c` to `pv-c`."
+    setup:
+      - kind: shell
+        desc: create three PVs and three mismatched claims
+        run: |
+          kubectl create ns broken
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata: {name: pv-a, labels: {klab: a}}
+          spec:
+            capacity: {storage: 1Gi}
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: gold
+            hostPath: {path: /tmp/klab-pv-a, type: DirectoryOrCreate}
+          ---
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata: {name: pv-b, labels: {klab: b}}
+          spec:
+            capacity: {storage: 2Gi}
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: silver
+            hostPath: {path: /tmp/klab-pv-b, type: DirectoryOrCreate}
+          ---
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata: {name: pv-c, labels: {klab: c}}
+          spec:
+            capacity: {storage: 1Gi}
+            accessModes: ["ReadWriteMany"]
+            storageClassName: bronze
+            hostPath: {path: /tmp/klab-pv-c, type: DirectoryOrCreate}
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: claim-a, namespace: broken}
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: platinum
+            resources: {requests: {storage: 500Mi}}
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: claim-b, namespace: broken}
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: silver
+            resources: {requests: {storage: 5Gi}}
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: claim-c, namespace: broken}
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: bronze
+            resources: {requests: {storage: 500Mi}}
+          YAML
+    verify:
+      - id: a
+        desc: claim-a is Bound to pv-a
+        points: 30
+        hint: "the class name is wrong -- pv-a is class gold"
+        run: |
+          RETRY=20 retry bash -c '[ "$(kubectl -n broken get pvc claim-a -o jsonpath="{.spec.volumeName}")" = "pv-a" ]'
+      - id: b
+        desc: claim-b is Bound to pv-b
+        points: 30
+        hint: "you cannot claim 5Gi from a 2Gi volume"
+        run: |
+          RETRY=20 retry bash -c '[ "$(kubectl -n broken get pvc claim-b -o jsonpath="{.spec.volumeName}")" = "pv-b" ]'
+      - id: c
+        desc: claim-c is Bound to pv-c
+        points: 30
+        hint: "pv-c only offers ReadWriteMany"
+        run: |
+          RETRY=20 retry bash -c '[ "$(kubectl -n broken get pvc claim-c -o jsonpath="{.spec.volumeName}")" = "pv-c" ]'
+      - id: pvs-untouched
+        desc: The PersistentVolumes were not modified
+        points: 10
+        hint: "fix the claims, not the volumes"
+        run: |
+          eq "$(jp pv pv-a '{.spec.storageClassName}')" "gold" || exit 1
+          eq "$(jp pv pv-b '{.spec.capacity.storage}')" "2Gi" || exit 1
+          jp pv pv-c '{.spec.accessModes[*]}' | grep -q ReadWriteMany
+    hints:
+      - title: Diagnose before you edit
+        cost: 8
+        text: |
+          ```
+          kubectl get pv
+          kubectl -n broken get pvc
+          kubectl -n broken describe pvc claim-a
+          ```
+          Put the two listings side by side and the three mismatches are
+          obvious: class, size, access mode.
+      - title: PVC specs are immutable
+        cost: 10
+        text: |
+          You cannot patch `storageClassName`, `accessModes` or shrink
+          `resources.requests` on an existing claim. Delete and recreate:
+
+          ```
+          kubectl -n broken delete pvc claim-a
+          kubectl apply -f fixed-claim-a.yaml
+          ```
+          (Growing a claim is allowed if the class has
+          `allowVolumeExpansion: true`, but that is not the problem here.)
+      - title: The three fixes
+        cost: 12
+        text: |
+          - `claim-a`: storageClassName `platinum` -> `gold`
+          - `claim-b`: request `5Gi` -> anything up to `2Gi`
+          - `claim-c`: accessModes `ReadWriteOnce` -> `ReadWriteMany`
+    solution: |
+      ```bash
+      kubectl -n broken delete pvc claim-a claim-b claim-c
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: claim-a, namespace: broken}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gold
+        resources: {requests: {storage: 500Mi}}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: claim-b, namespace: broken}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: silver
+        resources: {requests: {storage: 2Gi}}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: claim-c, namespace: broken}
+      spec:
+        accessModes: ["ReadWriteMany"]
+        storageClassName: bronze
+        resources: {requests: {storage: 500Mi}}
+      YAML
+      ```
+    solve_script: |
+      kubectl -n broken delete pvc claim-a claim-b claim-c --wait=true
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: claim-a, namespace: broken}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gold
+        resources: {requests: {storage: 500Mi}}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: claim-b, namespace: broken}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: silver
+        resources: {requests: {storage: 2Gi}}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: claim-c, namespace: broken}
+      spec:
+        accessModes: ["ReadWriteMany"]
+        storageClassName: bronze
+        resources: {requests: {storage: 500Mi}}
+      YAML
+      sleep 15
+
+  - id: store-reclaim-and-expand
+    title: Reclaim policies and growing a volume
+    difficulty: hard
+    exams: [CKA]
+    concepts: [reclaim policy, retain, delete, volume expansion, storageclass]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: What happens to the data when the claim goes away - and how to grow one.
+    scenario: |
+      Two operational questions that come up constantly:
+
+      1. When someone deletes a PVC, is the data destroyed? That is the
+         PV's `persistentVolumeReclaimPolicy` - `Delete` throws it away,
+         `Retain` keeps the PV and its data in a `Released` state for an
+         admin to deal with.
+      2. Can a volume grow in place? Only if its StorageClass sets
+         `allowVolumeExpansion: true`.
+
+      Configure both, and prove the retained volume really survives.
+    docs:
+      - https://kubernetes.io/docs/concepts/storage/persistent-volumes/#reclaiming
+      - https://kubernetes.io/docs/concepts/storage/persistent-volumes/#expanding-persistent-volumes-claims
+    tasks:
+      - text: "Create a StorageClass `expandable` with provisioner `rancher.io/local-path`, `allowVolumeExpansion: true` and volumeBindingMode `Immediate`."
+      - text: "Create a PV `pv-keep` (1Gi, ReadWriteOnce, storageClassName `keepme`, hostPath `/tmp/klab-keep`) with reclaim policy `Retain`."
+      - text: "Create PVC `keep-claim` in `reclaim` bound to it, then delete the PVC."
+      - text: "After deleting the claim, `pv-keep` must still exist with status `Released`."
+    setup:
+      - kind: shell
+        desc: create the reclaim namespace
+        run: kubectl create ns reclaim
+    verify:
+      - id: sc
+        desc: StorageClass expandable allows expansion and binds immediately
+        points: 30
+        hint: "allowVolumeExpansion and volumeBindingMode are top-level fields on a StorageClass, not under spec"
+        run: |
+          eq "$(jp sc expandable '{.allowVolumeExpansion}')" "true" || exit 1
+          eq "$(jp sc expandable '{.volumeBindingMode}')" "Immediate" || exit 1
+          jp sc expandable '{.provisioner}' | grep -q 'local-path'
+      - id: pv-exists
+        desc: PV pv-keep exists with reclaim policy Retain
+        points: 25
+        hint: "persistentVolumeReclaimPolicy: Retain"
+        run: |
+          eq "$(jp pv pv-keep '{.spec.persistentVolumeReclaimPolicy}')" "Retain" || exit 1
+          eq "$(jp pv pv-keep '{.spec.storageClassName}')" "keepme"
+      - id: claim-gone
+        desc: The keep-claim PVC has been deleted
+        points: 20
+        hint: "kubectl -n reclaim delete pvc keep-claim"
+        run: |
+          ! kubectl -n reclaim get pvc keep-claim >/dev/null 2>&1
+      - id: released
+        desc: pv-keep survived the deletion and is Released
+        points: 25
+        hint: "Retain means the PV outlives its claim -- it goes to Released, not Available"
+        run: |
+          RETRY=20 retry bash -c '[ "$(kubectl get pv pv-keep -o jsonpath="{.status.phase}")" = "Released" ]'
+    hints:
+      - title: A StorageClass has no spec
+        cost: 10
+        text: |
+          Its fields are top level:
+
+          ```yaml
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: expandable
+          provisioner: rancher.io/local-path
+          allowVolumeExpansion: true
+          volumeBindingMode: Immediate
+          reclaimPolicy: Delete
+          ```
+      - title: Getting to Released
+        cost: 10
+        text: |
+          Create the PV, create a matching PVC so it Binds, then delete the
+          PVC. With `Retain` the PV stays but moves to `Released` - it will
+          not be reused until an admin clears `spec.claimRef`.
+
+          If you never bound it, the PV stays `Available` and the check will
+          not pass.
+      - title: Verifying expansion is possible
+        cost: 8
+        text: |
+          ```
+          kubectl get sc expandable -o jsonpath='{.allowVolumeExpansion}'
+          ```
+          To actually grow a claim you edit
+          `spec.resources.requests.storage` upward - shrinking is never
+          allowed.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata: {name: expandable}
+      provisioner: rancher.io/local-path
+      allowVolumeExpansion: true
+      volumeBindingMode: Immediate
+      reclaimPolicy: Delete
+      ---
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata: {name: pv-keep}
+      spec:
+        capacity: {storage: 1Gi}
+        accessModes: ["ReadWriteOnce"]
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: keepme
+        hostPath: {path: /tmp/klab-keep, type: DirectoryOrCreate}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: keep-claim, namespace: reclaim}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: keepme
+        resources: {requests: {storage: 1Gi}}
+      YAML
+
+      kubectl -n reclaim wait --for=jsonpath='{.status.phase}'=Bound pvc/keep-claim --timeout=60s
+      kubectl -n reclaim delete pvc keep-claim
+      kubectl get pv pv-keep       # STATUS: Released
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata: {name: expandable}
+      provisioner: rancher.io/local-path
+      allowVolumeExpansion: true
+      volumeBindingMode: Immediate
+      reclaimPolicy: Delete
+      ---
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata: {name: pv-keep}
+      spec:
+        capacity: {storage: 1Gi}
+        accessModes: ["ReadWriteOnce"]
+        persistentVolumeReclaimPolicy: Retain
+        storageClassName: keepme
+        hostPath: {path: /tmp/klab-keep, type: DirectoryOrCreate}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata: {name: keep-claim, namespace: reclaim}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: keepme
+        resources: {requests: {storage: 1Gi}}
+      YAML
+      kubectl -n reclaim wait --for=jsonpath='{.status.phase}'=Bound pvc/keep-claim --timeout=120s
+      kubectl -n reclaim delete pvc keep-claim
+      sleep 10

@@ -1,0 +1,517 @@
+category: Observability & Logging
+labs:
+
+  - id: obs-logs
+    title: Logs - containers, previous instances and multi-container pods
+    difficulty: easy
+    exams: [KCNA, CKA, CKAD]
+    concepts: [logs, kubectl logs, stdout, log rotation, containers]
+    par_minutes: 11
+    estimated_minutes: 14
+    blurb: Everything writes to stdout. Learn the flags that get you to the right stream.
+    scenario: |
+      Kubernetes has no log aggregation of its own. The contract is simple:
+      write to stdout and stderr, and the kubelet keeps the last few files
+      on the node until the container is gone.
+
+      That means `kubectl logs` is the only tool you get in the exam, so
+      know its flags cold - especially `--previous`, which is the only way
+      to see why a crashed container died.
+    docs:
+      - https://kubernetes.io/docs/concepts/cluster-administration/logging/
+    tasks:
+      - text: "In namespace `logs`, there is a pod `restarter` that crashes and restarts. Capture the log line its *previous* instance printed into a ConfigMap `logfindings` key `previous`."
+      - text: "Pod `twins` has two containers, `alpha` and `beta`. Capture the line printed by `beta` into key `beta`."
+      - text: "Record under key `flag` the kubectl logs flag that shows a crashed container's earlier output."
+      - text: "Record under key `all_containers` the kubectl logs flag that streams every container of a pod at once."
+    setup:
+      - kind: shell
+        desc: create a crashing pod and a two-container pod
+        timeout: 300
+        run: |
+          kubectl create ns logs
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: restarter, namespace: logs}
+          spec:
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sh", "-c", "echo GOODBYE-CRUEL-WORLD; sleep 5; exit 1"]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: twins, namespace: logs}
+          spec:
+            containers:
+              - name: alpha
+                image: busybox:1.36
+                command: ["sh", "-c", "while true; do echo ALPHA-SPEAKING; sleep 5; done"]
+              - name: beta
+                image: busybox:1.36
+                command: ["sh", "-c", "while true; do echo BETA-SPEAKING; sleep 5; done"]
+          YAML
+          kubectl -n logs wait --for=condition=Ready pod/twins --timeout=240s
+          sleep 25
+    verify:
+      - id: previous
+        desc: You captured the previous instance's log line
+        points: 30
+        hint: "kubectl -n logs logs restarter --previous"
+        run: |
+          jp cm logfindings '{.data.previous}' -n logs | grep -q 'GOODBYE-CRUEL-WORLD'
+      - id: beta
+        desc: You captured the beta container's output specifically
+        points: 30
+        hint: "kubectl -n logs logs twins -c beta"
+        run: |
+          got=$(jp cm logfindings '{.data.beta}' -n logs)
+          echo "$got" | grep -q 'BETA-SPEAKING' || exit 1
+          ! echo "$got" | grep -q 'ALPHA-SPEAKING'
+      - id: flag
+        desc: The previous-logs flag is recorded
+        points: 20
+        hint: "it has a short form -p"
+        run: |
+          jp cm logfindings '{.data.flag}' -n logs | tr -d ' ' | grep -Eq '^--?(p|previous)$|^--previous$'
+      - id: all-containers
+        desc: The all-containers flag is recorded
+        points: 20
+        hint: "kubectl logs --help | grep -i all"
+        run: |
+          jp cm logfindings '{.data.all_containers}' -n logs | tr -d ' ' | grep -q '^--all-containers$'
+    hints:
+      - title: The flags worth memorising
+        cost: 8
+        text: |
+          ```
+          kubectl logs POD                       # single-container pod
+          kubectl logs POD -c NAME               # pick a container
+          kubectl logs POD --all-containers      # every container
+          kubectl logs POD --previous            # the instance before this one
+          kubectl logs POD -f --tail=50          # follow the last 50 lines
+          kubectl logs -l app=web --prefix       # every pod matching a selector
+          ```
+      - title: Getting output into a ConfigMap
+        cost: 8
+        text: |
+          ```
+          kubectl -n logs logs restarter --previous > prev.txt
+          kubectl -n logs logs twins -c beta --tail=5 > beta.txt
+          kubectl -n logs create configmap logfindings \
+            --from-file=previous=prev.txt --from-file=beta=beta.txt \
+            --from-literal=flag=--previous \
+            --from-literal=all_containers=--all-containers
+          ```
+      - title: When --previous says there is nothing
+        cost: 8
+        text: |
+          It only works while the *previous* container is still on the node.
+          If the pod has been rescheduled, or the node restarted, the logs
+          are gone - which is the argument for shipping logs off the node.
+    solution: |
+      ```bash
+      kubectl -n logs logs restarter --previous > /tmp/prev.txt
+      kubectl -n logs logs twins -c beta --tail=5 > /tmp/beta.txt
+
+      kubectl -n logs create configmap logfindings \
+        --from-file=previous=/tmp/prev.txt \
+        --from-file=beta=/tmp/beta.txt \
+        --from-literal=flag=--previous \
+        --from-literal=all_containers=--all-containers
+      ```
+    solve_script: |
+      kubectl -n logs logs restarter --previous > /tmp/klab-prev.txt 2>/dev/null || \
+        kubectl -n logs logs restarter > /tmp/klab-prev.txt
+      kubectl -n logs logs twins -c beta --tail=5 > /tmp/klab-beta.txt
+      kubectl -n logs create configmap logfindings \
+        --from-file=previous=/tmp/klab-prev.txt \
+        --from-file=beta=/tmp/klab-beta.txt \
+        --from-literal=flag=--previous \
+        --from-literal=all_containers=--all-containers
+
+  - id: obs-metrics-server
+    title: kubectl top and where those numbers come from
+    difficulty: medium
+    exams: [KCNA, CKA]
+    concepts: [metrics-server, metrics api, kubectl top, resource usage]
+    par_minutes: 12
+    estimated_minutes: 16
+    cluster:
+      install:
+        - name: metrics-server
+          timeout: 420
+          run: |
+            kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+            kubectl -n kube-system patch deployment metrics-server --type=json \
+              -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+            kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s
+    blurb: The metrics API is an aggregated API, not part of the core API server.
+    scenario: |
+      `kubectl top` reads `metrics.k8s.io`, which is not built into the API
+      server - it is an *aggregated* API served by metrics-server and
+      registered through an APIService object. That is why `top` fails on a
+      cluster where nobody installed it, with a confusing error.
+
+      metrics-server is running here. Confirm the whole chain and record
+      what you find.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/
+    tasks:
+      - text: "Confirm `kubectl top nodes` and `kubectl top pods -A` return data."
+      - text: "Record in ConfigMap `metricsinfo` in `klab`: key `apiservice` = the name of the APIService object that registers the metrics API."
+      - text: "Key `group` = the API group `kubectl top` reads from."
+      - text: "Key `available` = `True` if that APIService reports Available."
+      - text: "Deploy `busy` in namespace `klab` (1 replica of `nginx:1.27-alpine`) and confirm it shows up in `kubectl top pods -n klab`."
+    setup:
+      - kind: shell
+        desc: create the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: top-works
+        desc: The metrics API is serving data
+        points: 30
+        hint: "kubectl top nodes -- give metrics-server a minute after install"
+        run: |
+          RETRY=40 retry bash -c 'kubectl top nodes --no-headers 2>/dev/null | grep -q .'
+      - id: apiservice
+        desc: You recorded the right APIService name
+        points: 25
+        hint: "kubectl get apiservices | grep metrics"
+        run: |
+          want=$(kubectl get apiservices -o name | grep 'metrics.k8s.io' | head -1 | cut -d/ -f2)
+          got=$(jp cm metricsinfo '{.data.apiservice}' -n klab | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: group
+        desc: You recorded the right API group
+        points: 20
+        hint: "the group is metrics.k8s.io"
+        run: |
+          eq "$(jp cm metricsinfo '{.data.group}' -n klab | tr -d ' ')" "metrics.k8s.io"
+      - id: available
+        desc: You recorded the APIService availability
+        points: 10
+        hint: "kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.status.conditions[?(@.type==\"Available\")].status}'"
+        run: |
+          eq "$(jp cm metricsinfo '{.data.available}' -n klab | tr -d ' ')" "True"
+      - id: busy-metrics
+        desc: The busy Deployment appears in kubectl top pods
+        points: 15
+        hint: "metrics take about a minute to appear for a new pod"
+        run: |
+          rollout klab deploy/busy 240s || exit 1
+          RETRY=40 retry bash -c 'kubectl top pods -n klab --no-headers 2>/dev/null | grep -q busy'
+    hints:
+      - title: The chain to check
+        cost: 10
+        text: |
+          ```
+          kubectl get apiservices | grep metrics
+          kubectl -n kube-system get deploy metrics-server
+          kubectl top nodes
+          kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes | head -c 300
+          ```
+          The last one talks to the aggregated API directly - useful when
+          you want to know whether `top` or the API is the problem.
+      - title: Why top fails on a fresh cluster
+        cost: 8
+        text: |
+          `error: Metrics API not available` means no APIService is
+          registered for `metrics.k8s.io`. Nothing is broken - metrics-server
+          is simply an add-on that nobody installed. The same applies to the
+          Kubernetes Dashboard and to HPAs based on CPU percentage.
+      - title: Recording the answers
+        cost: 8
+        text: |
+          ```
+          AS=$(kubectl get apiservices -o name | grep metrics.k8s.io | cut -d/ -f2)
+          AV=$(kubectl get apiservice $AS -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+          kubectl -n klab create configmap metricsinfo \
+            --from-literal=apiservice=$AS --from-literal=group=metrics.k8s.io \
+            --from-literal=available=$AV
+          ```
+    solution: |
+      ```bash
+      kubectl top nodes
+      kubectl top pods -A | head
+
+      kubectl -n klab create deployment busy --image=nginx:1.27-alpine
+      kubectl -n klab rollout status deploy/busy
+
+      AS=$(kubectl get apiservices -o name | grep metrics.k8s.io | cut -d/ -f2)
+      AV=$(kubectl get apiservice $AS -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+
+      kubectl -n klab create configmap metricsinfo \
+        --from-literal=apiservice=$AS \
+        --from-literal=group=metrics.k8s.io \
+        --from-literal=available=$AV
+      ```
+    solve_script: |
+      kubectl -n klab create deployment busy --image=nginx:1.27-alpine
+      kubectl -n klab rollout status deploy/busy --timeout=240s
+      AS=$(kubectl get apiservices -o name | grep metrics.k8s.io | head -1 | cut -d/ -f2)
+      AV=$(kubectl get apiservice $AS -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+      kubectl -n klab create configmap metricsinfo \
+        --from-literal=apiservice=$AS --from-literal=group=metrics.k8s.io --from-literal=available=$AV
+      sleep 60
+
+  - id: obs-events
+    title: Events - the cluster's own account of what happened
+    difficulty: easy
+    exams: [CKA, CKAD]
+    concepts: [events, field selectors, troubleshooting, sorting]
+    par_minutes: 10
+    estimated_minutes: 13
+    blurb: Sort them, filter them, and know that they expire after an hour.
+    scenario: |
+      Events are how controllers explain themselves: why a pod would not
+      schedule, why an image pull failed, why a probe is failing. They are
+      also the first thing people forget to look at.
+
+      Two things to internalise: they are **not** sorted by time by default,
+      and they are garbage-collected after about an hour. An event that
+      matters is one you have to catch quickly.
+    docs:
+      - https://kubernetes.io/docs/reference/kubectl/generated/kubectl_events/
+    tasks:
+      - text: "A pod in `evts` is failing to pull its image. Find the event that explains why."
+      - text: "Record in ConfigMap `eventinfo` in `evts`: key `reason` = the event Reason for the failed image pull."
+      - text: "Key `sort_flag` = the kubectl get events flag that sorts events by creation time (the whole flag including its value)."
+      - text: "Key `field_selector` = a field selector expression that shows only Warning events (the whole `--field-selector` value)."
+    setup:
+      - kind: shell
+        desc: create a pod with an unpullable image
+        timeout: 300
+        run: |
+          kubectl create ns evts
+          kubectl -n evts run puller --image=registry.k8s.io/klab-does-not-exist:v9 --restart=Never
+          sleep 40
+    verify:
+      - id: reason
+        desc: You identified the image pull failure reason
+        points: 40
+        hint: "kubectl -n evts describe pod puller -- look at the Events Reason column"
+        run: |
+          got=$(jp cm eventinfo '{.data.reason}' -n evts | tr -d ' ')
+          echo "$got" | grep -Eq '^(Failed|ErrImagePull|ImagePullBackOff|BackOff)$'
+      - id: sort-flag
+        desc: The sort flag is recorded correctly
+        points: 30
+        hint: "--sort-by=.metadata.creationTimestamp"
+        run: |
+          got=$(jp cm eventinfo '{.data.sort_flag}' -n evts | tr -d ' ')
+          echo "$got" | grep -q 'sort-by' && echo "$got" | grep -q 'creationTimestamp'
+      - id: field-selector
+        desc: A field selector for Warning events is recorded
+        points: 30
+        hint: "type=Warning"
+        run: |
+          got=$(jp cm eventinfo '{.data.field_selector}' -n evts | tr -d ' ')
+          echo "$got" | grep -q 'type=Warning'
+    hints:
+      - title: Three ways to read events
+        cost: 8
+        text: |
+          ```
+          kubectl -n evts describe pod puller            # the pod's own events
+          kubectl -n evts get events --sort-by=.metadata.creationTimestamp
+          kubectl -n evts events --for pod/puller        # the newer dedicated command
+          ```
+      - title: Filtering
+        cost: 8
+        text: |
+          ```
+          kubectl get events -A --field-selector type=Warning
+          kubectl get events -n evts --field-selector involvedObject.name=puller
+          kubectl get events -n evts --field-selector reason=Failed
+          ```
+          Field selectors work server-side, so they are much faster than
+          piping everything through grep on a busy cluster.
+      - title: What you are looking for here
+        cost: 8
+        text: |
+          The pull failure produces a chain: `Pulling`, then `Failed` with
+          the registry error, then `BackOff` as the kubelet retries with
+          increasing delay. The `Failed` event carries the actual reason.
+    solution: |
+      ```bash
+      kubectl -n evts describe pod puller | tail -12
+      kubectl -n evts get events --sort-by=.metadata.creationTimestamp | tail
+
+      kubectl -n evts create configmap eventinfo \
+        --from-literal=reason=Failed \
+        --from-literal=sort_flag=--sort-by=.metadata.creationTimestamp \
+        --from-literal=field_selector=type=Warning
+      ```
+    solve_script: |
+      kubectl -n evts create configmap eventinfo \
+        --from-literal=reason=Failed \
+        --from-literal=sort_flag=--sort-by=.metadata.creationTimestamp \
+        --from-literal=field_selector=type=Warning
+
+  - id: obs-app-instrumentation
+    title: Expose application metrics for scraping
+    difficulty: medium
+    exams: [CKAD, KCNA]
+    concepts: [prometheus, metrics endpoint, annotations, sidecar, observability]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: The conventions that let a monitoring system find your app without being told.
+    scenario: |
+      Prometheus-style monitoring is pull-based: something scrapes an HTTP
+      endpoint on your pod. The conventions are informal but near-universal:
+
+      - a named container port called `metrics`
+      - an HTTP path, usually `/metrics`
+      - either the `prometheus.io/scrape` annotations, or a ServiceMonitor
+        if you are running the Prometheus Operator
+
+      Wire up a Deployment so a scraper could find it, and expose the port
+      through a Service.
+    docs:
+      - https://kubernetes.io/docs/concepts/cluster-administration/monitoring/
+    tasks:
+      - text: "Deployment `monitored/api` must declare a container port named `metrics` on 9113."
+      - text: "Its pod template must carry annotations `prometheus.io/scrape: \"true\"`, `prometheus.io/port: \"9113\"` and `prometheus.io/path: \"/metrics\"`."
+      - text: "Add a sidecar container `exporter` (`nginx/nginx-prometheus-exporter:1.3.0`) that listens on 9113, with argument `--nginx.scrape-uri=http://127.0.0.1:8080/stub_status`."
+      - text: "Create a Service `monitored/api` exposing port 80 (to 8080) named `http` and port 9113 named `metrics`."
+      - text: "The Deployment must be Ready and the metrics endpoint must answer."
+    setup:
+      - kind: shell
+        desc: deploy an app with no instrumentation
+        run: |
+          kubectl create ns monitored
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: api, namespace: monitored}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: api}}
+            template:
+              metadata: {labels: {app: api}}
+              spec:
+                containers:
+                  - name: web
+                    image: nginxinc/nginx-unprivileged:1.27-alpine
+                    ports: [{containerPort: 8080, name: http}]
+          YAML
+          kubectl -n monitored rollout status deploy/api --timeout=240s
+    verify:
+      - id: annotations
+        desc: The pod template carries the prometheus scrape annotations
+        points: 25
+        hint: "they go on spec.template.metadata.annotations, not on the Deployment itself"
+        run: |
+          a='.spec.template.metadata.annotations'
+          eq "$(jp deploy api "{$a.prometheus\.io/scrape}" -n monitored)" "true" || exit 1
+          eq "$(jp deploy api "{$a.prometheus\.io/port}" -n monitored)" "9113" || exit 1
+          eq "$(jp deploy api "{$a.prometheus\.io/path}" -n monitored)" "/metrics"
+      - id: sidecar
+        desc: An exporter sidecar exposes a container port named metrics on 9113
+        points: 30
+        hint: "a second entry under spec.template.spec.containers"
+        run: |
+          jp deploy api '{.spec.template.spec.containers[*].name}' -n monitored | grep -q exporter || exit 1
+          jp deploy api '{.spec.template.spec.containers[*].ports[*].name}' -n monitored | grep -q metrics || exit 1
+          jp deploy api '{.spec.template.spec.containers[*].ports[*].containerPort}' -n monitored | grep -q 9113
+      - id: service
+        desc: The Service exposes both named ports
+        points: 25
+        hint: "multi-port Services must name every port"
+        run: |
+          names=$(jp svc api '{.spec.ports[*].name}' -n monitored | tr ' ' '\n' | sort | tr '\n' ' ')
+          eq "$names" "http metrics " || exit 1
+          eq "$(jp svc api '{.spec.ports[?(@.name=="metrics")].port}' -n monitored)" "9113"
+      - id: scrapeable
+        desc: The metrics endpoint really answers
+        points: 20
+        hint: "kubectl -n monitored exec deploy/api -c exporter -- wget -qO- 127.0.0.1:9113/metrics | head"
+        run: |
+          rollout monitored deploy/api 300s || exit 1
+          RETRY=20 retry bash -c 'kubectl -n monitored run klabcurl --rm -i --restart=Never --quiet \
+            --image=curlimages/curl:8.10.1 --command -- \
+            curl -sf http://api.monitored.svc.cluster.local:9113/metrics -o /dev/null'
+    hints:
+      - title: The nginx side of it
+        cost: 10
+        text: |
+          The exporter scrapes nginx's `stub_status` page. The unprivileged
+          nginx image does not enable it by default, but the exporter still
+          serves its own `/metrics` (with an nginx-up value of 0), which is
+          enough here - the lab is about the wiring, not about nginx.
+      - title: Adding the sidecar
+        cost: 12
+        text: |
+          ```
+          kubectl -n monitored patch deploy api --type=strategic -p '
+          spec:
+            template:
+              metadata:
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "9113"
+                  prometheus.io/path: "/metrics"
+              spec:
+                containers:
+                  - name: exporter
+                    image: nginx/nginx-prometheus-exporter:1.3.0
+                    args: ["--nginx.scrape-uri=http://127.0.0.1:8080/stub_status"]
+                    ports:
+                      - containerPort: 9113
+                        name: metrics
+          '
+          ```
+          A strategic merge patch matches list items by name, so a container
+          name that does not exist yet is *added* rather than replacing
+          anything.
+      - title: The Service
+        cost: 10
+        text: |
+          ```yaml
+          spec:
+            selector: {app: api}
+            ports:
+              - {name: http, port: 80, targetPort: 8080}
+              - {name: metrics, port: 9113, targetPort: 9113}
+          ```
+    solution: |
+      ```bash
+      kubectl -n monitored patch deploy api --type=strategic -p '{"spec":{"template":{
+        "metadata":{"annotations":{
+          "prometheus.io/scrape":"true",
+          "prometheus.io/port":"9113",
+          "prometheus.io/path":"/metrics"}},
+        "spec":{"containers":[{
+          "name":"exporter",
+          "image":"nginx/nginx-prometheus-exporter:1.3.0",
+          "args":["--nginx.scrape-uri=http://127.0.0.1:8080/stub_status"],
+          "ports":[{"containerPort":9113,"name":"metrics"}]}]}}}}'
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Service
+      metadata: {name: api, namespace: monitored}
+      spec:
+        selector: {app: api}
+        ports:
+          - {name: http, port: 80, targetPort: 8080}
+          - {name: metrics, port: 9113, targetPort: 9113}
+      YAML
+
+      kubectl -n monitored rollout status deploy/api
+      ```
+    solve_script: |
+      kubectl -n monitored patch deploy api --type=strategic -p '{"spec":{"template":{"metadata":{"annotations":{"prometheus.io/scrape":"true","prometheus.io/port":"9113","prometheus.io/path":"/metrics"}},"spec":{"containers":[{"name":"exporter","image":"nginx/nginx-prometheus-exporter:1.3.0","args":["--nginx.scrape-uri=http://127.0.0.1:8080/stub_status"],"ports":[{"containerPort":9113,"name":"metrics"}]}]}}}}'
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Service
+      metadata: {name: api, namespace: monitored}
+      spec:
+        selector: {app: api}
+        ports:
+          - {name: http, port: 80, targetPort: 8080}
+          - {name: metrics, port: 9113, targetPort: 9113}
+      YAML
+      kubectl -n monitored rollout status deploy/api --timeout=300s

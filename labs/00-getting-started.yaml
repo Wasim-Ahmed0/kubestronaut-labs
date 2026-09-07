@@ -1,0 +1,700 @@
+category: Getting Started
+labs:
+
+  - id: start-first-steps
+    title: Your very first five kubectl commands
+    difficulty: intro
+    exams: [KCNA]
+    concepts: [kubectl, basics, namespaces, nodes]
+    par_minutes: 8
+    estimated_minutes: 12
+    blurb: If you have never touched Kubernetes, start here. Nothing to install, nothing to break.
+    scenario: |
+      Welcome. You have a real, running Kubernetes cluster in front of you
+      and a shell that is already pointed at it.
+
+      Kubernetes is a system that runs containers for you and keeps them
+      running. You tell it what you *want* ("three copies of this web
+      server"), and it constantly works to make reality match. You talk to
+      it with one command: `kubectl`.
+
+      Almost every kubectl command has the same shape:
+
+      ```
+      kubectl <verb> <thing> [name] [flags]
+      ```
+
+      like `kubectl get pods`, `kubectl describe node worker-1`,
+      `kubectl delete pod web`.
+
+      This lab is just about getting your hands moving. Try these first and
+      look at what comes back - none of them change anything:
+
+      ```
+      kubectl get nodes
+      kubectl get namespaces
+      kubectl get pods -A
+      kubectl version
+      ```
+
+      Then do the four tasks below. When you think you are done, type
+      `verify`. If something is not right it will tell you which bit, and
+      you can keep going - nothing is lost.
+    docs:
+      - https://kubernetes.io/docs/reference/kubectl/quick-reference/
+    tasks:
+      - text: "Create a namespace called `hello`. A namespace is just a folder to keep things separate."
+      - text: "Run a single container in it called `first-pod`, using the image `nginx:1.27-alpine`."
+      - text: "Add the label `owner=me` to that pod."
+      - text: "Get the pod to the point where it reports Running."
+    setup: []
+    verify:
+      - id: namespace
+        desc: A namespace called hello exists
+        points: 25
+        hint: "kubectl create namespace hello"
+        run: |
+          has ns hello
+      - id: pod
+        desc: A pod named first-pod exists in hello, running nginx
+        points: 30
+        hint: "kubectl -n hello run first-pod --image=nginx:1.27-alpine"
+        run: |
+          jp pod first-pod '{.spec.containers[0].image}' -n hello | grep -q 'nginx'
+      - id: label
+        desc: The pod carries the label owner=me
+        points: 20
+        hint: "kubectl -n hello label pod first-pod owner=me"
+        run: |
+          eq "$(jp pod first-pod '{.metadata.labels.owner}' -n hello)" "me"
+      - id: running
+        desc: The pod is Running
+        points: 25
+        hint: "kubectl -n hello get pod first-pod -- give it a few seconds to pull the image"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n hello get pod first-pod -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: Creating a namespace
+        cost: 5
+        text: |
+          ```
+          kubectl create namespace hello
+          ```
+          Check it worked with `kubectl get namespaces` - yours should be in
+          the list alongside the `kube-*` ones Kubernetes uses itself.
+      - title: Running a container
+        cost: 6
+        text: |
+          ```
+          kubectl -n hello run first-pod --image=nginx:1.27-alpine
+          ```
+          `-n hello` means "in the hello namespace". Leave it out and things
+          land in `default`, which is a very common source of confusion.
+      - title: Adding a label
+        cost: 6
+        text: |
+          ```
+          kubectl -n hello label pod first-pod owner=me
+          ```
+          Labels are key=value tags. They look trivial now, but they are how
+          nearly everything in Kubernetes finds everything else.
+      - title: Watching it start
+        cost: 5
+        text: |
+          ```
+          kubectl -n hello get pod first-pod -w
+          ```
+          `-w` watches for changes; press Ctrl-C to stop. It goes
+          `Pending` -> `ContainerCreating` -> `Running` as the image
+          downloads and the container starts.
+    solution: |
+      ```bash
+      kubectl create namespace hello
+      kubectl -n hello run first-pod --image=nginx:1.27-alpine
+      kubectl -n hello label pod first-pod owner=me
+      kubectl -n hello get pod first-pod
+      ```
+    solve_script: |
+      kubectl create namespace hello
+      kubectl -n hello run first-pod --image=nginx:1.27-alpine
+      kubectl -n hello label pod first-pod owner=me
+      kubectl -n hello wait --for=condition=Ready pod/first-pod --timeout=240s
+
+  - id: start-look-inside
+    title: Look inside a running container
+    difficulty: intro
+    exams: [KCNA, CKAD]
+    concepts: [kubectl exec, logs, describe, port-forward, debugging basics]
+    par_minutes: 10
+    estimated_minutes: 14
+    blurb: exec, logs, describe and port-forward - the four ways to see what is going on.
+    scenario: |
+      A container is running somewhere on some machine. These four commands
+      are how you reach it, and you will use them every single day:
+
+      - `kubectl describe pod NAME` - what Kubernetes thinks about the pod:
+        which node, which image, and an Events list at the bottom that
+        explains anything that went wrong
+      - `kubectl logs NAME` - whatever the program printed
+      - `kubectl exec -it NAME -- sh` - a shell *inside* the container
+      - `kubectl port-forward NAME 8080:80` - tunnel a port to your laptop
+
+      There is a pod called `inspect-me` waiting in the `look` namespace.
+      Go and find things out about it.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/
+    tasks:
+      - text: "Find which node the pod `look/inspect-me` is running on, and put it in a ConfigMap `findings` in `look` under key `node`."
+      - text: "Find the pod's IP address and record it under key `ip`."
+      - text: "Use `kubectl exec` to create the file `/tmp/i-was-here` inside the container."
+      - text: "Read the file `/etc/motd-klab` that is already inside the container, and record its contents under key `motd`."
+    setup:
+      - kind: shell
+        desc: create a pod with a hidden message inside it
+        timeout: 300
+        run: |
+          kubectl create ns look
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: inspect-me, namespace: look}
+          spec:
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sh", "-c"]
+                args: ["echo kubestronaut-in-training > /etc/motd-klab; while true; do echo still here; sleep 10; done"]
+          YAML
+          kubectl -n look wait --for=condition=Ready pod/inspect-me --timeout=240s
+    verify:
+      - id: node
+        desc: You recorded the node the pod is actually on
+        points: 25
+        hint: "kubectl -n look get pod inspect-me -o wide -- the NODE column"
+        run: |
+          want=$(jp pod inspect-me '{.spec.nodeName}' -n look)
+          got=$(jp cm findings '{.data.node}' -n look | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: ip
+        desc: You recorded the pod's real IP address
+        points: 25
+        hint: "the IP column of kubectl get pod -o wide"
+        run: |
+          want=$(jp pod inspect-me '{.status.podIP}' -n look)
+          got=$(jp cm findings '{.data.ip}' -n look | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: exec-file
+        desc: The file /tmp/i-was-here exists inside the container
+        points: 25
+        hint: "kubectl -n look exec inspect-me -- touch /tmp/i-was-here"
+        run: |
+          kubectl -n look exec inspect-me -- ls /tmp/i-was-here >/dev/null 2>&1
+      - id: motd
+        desc: You read the message hidden inside the container
+        points: 25
+        hint: "kubectl -n look exec inspect-me -- cat /etc/motd-klab"
+        run: |
+          jp cm findings '{.data.motd}' -n look | grep -q 'kubestronaut-in-training'
+    hints:
+      - title: The wide output
+        cost: 5
+        text: |
+          ```
+          kubectl -n look get pod inspect-me -o wide
+          ```
+          adds NODE, IP and a few other columns that the plain listing hides.
+      - title: Running a command inside the container
+        cost: 6
+        text: |
+          ```
+          kubectl -n look exec inspect-me -- touch /tmp/i-was-here
+          kubectl -n look exec inspect-me -- cat /etc/motd-klab
+          kubectl -n look exec -it inspect-me -- sh        # interactive shell
+          ```
+          Everything after `--` runs inside the container. Forgetting the
+          `--` is the classic beginner mistake.
+      - title: Saving the answers
+        cost: 8
+        text: |
+          ```
+          NODE=$(kubectl -n look get pod inspect-me -o jsonpath='{.spec.nodeName}')
+          IP=$(kubectl -n look get pod inspect-me -o jsonpath='{.status.podIP}')
+          MOTD=$(kubectl -n look exec inspect-me -- cat /etc/motd-klab)
+
+          kubectl -n look create configmap findings \
+            --from-literal=node=$NODE --from-literal=ip=$IP --from-literal=motd=$MOTD
+          ```
+          `-o jsonpath=...` pulls one field out of an object - it is worth
+          getting comfortable with, it appears everywhere.
+    solution: |
+      ```bash
+      kubectl -n look get pod inspect-me -o wide
+      kubectl -n look describe pod inspect-me | head -20
+      kubectl -n look logs inspect-me --tail=5
+
+      kubectl -n look exec inspect-me -- touch /tmp/i-was-here
+
+      NODE=$(kubectl -n look get pod inspect-me -o jsonpath='{.spec.nodeName}')
+      IP=$(kubectl -n look get pod inspect-me -o jsonpath='{.status.podIP}')
+      MOTD=$(kubectl -n look exec inspect-me -- cat /etc/motd-klab)
+
+      kubectl -n look create configmap findings \
+        --from-literal=node=$NODE --from-literal=ip=$IP --from-literal=motd=$MOTD
+      ```
+    solve_script: |
+      kubectl -n look exec inspect-me -- touch /tmp/i-was-here
+      NODE=$(kubectl -n look get pod inspect-me -o jsonpath='{.spec.nodeName}')
+      IP=$(kubectl -n look get pod inspect-me -o jsonpath='{.status.podIP}')
+      MOTD=$(kubectl -n look exec inspect-me -- cat /etc/motd-klab)
+      kubectl -n look create configmap findings \
+        --from-literal=node=$NODE --from-literal=ip=$IP --from-literal=motd=$MOTD
+
+  - id: start-deployment-and-service
+    title: From one pod to a real application
+    difficulty: intro
+    exams: [KCNA, CKAD]
+    concepts: [deployments, services, replicas, self-healing, scaling]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: Why nobody runs bare pods, and how anything ever reaches your app.
+    scenario: |
+      A bare pod has two problems. Delete it and it is gone forever, and it
+      has an IP address that changes every time it restarts.
+
+      Two objects fix that:
+
+      - A **Deployment** says "keep N copies of this running". If one dies,
+        it makes a new one. If you change the image, it replaces them one at
+        a time.
+      - A **Service** gives that group one stable name and IP. Anything in
+        the cluster can reach `http://shop` and be routed to a healthy pod.
+
+      Build both, then break one on purpose and watch Kubernetes fix it.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+      - https://kubernetes.io/docs/concepts/services-networking/service/
+    tasks:
+      - text: "In namespace `shop`, create a Deployment `shop` with 3 replicas of `nginx:1.27-alpine`."
+      - text: "Expose it with a Service also called `shop` on port 80."
+      - text: "Delete one of the pods, and confirm the Deployment replaces it so you are back to 3."
+      - text: "Scale the Deployment up to 5 replicas."
+    setup:
+      - kind: shell
+        desc: create the shop namespace
+        run: kubectl create ns shop
+    verify:
+      - id: deployment
+        desc: Deployment shop/shop exists running nginx
+        points: 25
+        hint: "kubectl -n shop create deployment shop --image=nginx:1.27-alpine --replicas=3"
+        run: |
+          jp deploy shop '{.spec.template.spec.containers[0].image}' -n shop | grep -q nginx
+      - id: scaled
+        desc: It is scaled to 5 and all 5 are ready
+        points: 30
+        hint: "kubectl -n shop scale deployment shop --replicas=5"
+        run: |
+          eq "$(jp deploy shop '{.spec.replicas}' -n shop)" "5" || exit 1
+          RETRY=40 retry bash -c '[ "$(kubectl -n shop get deploy shop -o jsonpath="{.status.readyReplicas}")" = "5" ]'
+      - id: service
+        desc: A Service shop/shop exists on port 80
+        points: 25
+        hint: "kubectl -n shop expose deployment shop --port=80"
+        run: |
+          eq "$(jp svc shop '{.spec.ports[0].port}' -n shop)" "80"
+      - id: reachable
+        desc: The Service actually routes to the pods
+        points: 20
+        hint: "if there are no endpoints, the Service selector does not match the pods"
+        run: |
+          RETRY=25 retry bash -c "kubectl -n shop get endpointslices -l kubernetes.io/service-name=shop \
+            -o jsonpath='{.items[*].endpoints[*].addresses[*]}' | grep -q ."
+    hints:
+      - title: Creating the Deployment
+        cost: 6
+        text: |
+          ```
+          kubectl -n shop create deployment shop --image=nginx:1.27-alpine --replicas=3
+          kubectl -n shop get pods
+          ```
+          Notice the pod names: `shop-<random>-<random>`. You never choose
+          them, and that is the point - the pods are disposable.
+      - title: Watching self-healing
+        cost: 8
+        text: |
+          ```
+          kubectl -n shop get pods
+          kubectl -n shop delete pod <one of the names>
+          kubectl -n shop get pods
+          ```
+          A replacement appears within a second or two. Nothing you did
+          asked for that - the Deployment controller noticed reality did not
+          match your stated wish and fixed it.
+      - title: Exposing and scaling
+        cost: 8
+        text: |
+          ```
+          kubectl -n shop expose deployment shop --port=80
+          kubectl -n shop scale deployment shop --replicas=5
+          kubectl -n shop get endpointslices
+          ```
+          `expose` builds the Service and copies the Deployment's labels
+          into its selector so it picks up exactly those pods.
+      - title: Proving it serves traffic
+        cost: 8
+        text: |
+          ```
+          kubectl -n shop run curl --rm -it --restart=Never \
+            --image=curlimages/curl:8.10.1 -- -s http://shop | head -5
+          ```
+          That starts a throwaway pod inside the cluster, makes one request
+          to your Service by name, prints the result and deletes itself.
+    solution: |
+      ```bash
+      kubectl -n shop create deployment shop --image=nginx:1.27-alpine --replicas=3
+      kubectl -n shop rollout status deployment/shop
+
+      kubectl -n shop expose deployment shop --port=80
+
+      kubectl -n shop delete pod $(kubectl -n shop get pods -o name | head -1)
+      kubectl -n shop get pods          # back to 3 on its own
+
+      kubectl -n shop scale deployment shop --replicas=5
+      kubectl -n shop get endpointslices
+      ```
+    solve_script: |
+      kubectl -n shop create deployment shop --image=nginx:1.27-alpine --replicas=3
+      kubectl -n shop rollout status deployment/shop --timeout=240s
+      kubectl -n shop expose deployment shop --port=80
+      kubectl -n shop delete pod $(kubectl -n shop get pods -o name | head -1)
+      kubectl -n shop scale deployment shop --replicas=5
+      kubectl -n shop rollout status deployment/shop --timeout=240s
+
+  - id: start-reading-yaml
+    title: Read and fix a broken YAML manifest
+    difficulty: intro
+    exams: [KCNA, CKAD]
+    concepts: [yaml, manifests, apply, indentation, api objects]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: YAML indentation causes more Kubernetes pain than any actual Kubernetes concept.
+    scenario: |
+      Everything in Kubernetes can be written as a YAML file and applied
+      with `kubectl apply -f file.yaml`. That is how real work is done -
+      the file goes in git, and the cluster is a reflection of it.
+
+      Every manifest has the same four top-level keys:
+
+      ```yaml
+      apiVersion: apps/v1        # which API this object belongs to
+      kind: Deployment           # what type of object
+      metadata:                  # its name, namespace and labels
+        name: web
+      spec:                      # what you want it to be like
+        ...
+      ```
+
+      In your working directory there is a file `broken.yaml` with three
+      mistakes in it. Fix them and apply it.
+
+      Two things that will save you a lot of time:
+
+      - YAML uses **spaces only**, never tabs
+      - `kubectl apply --dry-run=client -f broken.yaml` checks a file
+        without touching the cluster
+    docs:
+      - https://kubernetes.io/docs/concepts/overview/working-with-objects/
+    tasks:
+      - text: "Open `broken.yaml` in your lab working directory and find the three mistakes."
+      - text: "Fix them so the file is a valid Deployment."
+      - text: "Apply it, creating Deployment `yamlfix/site` with 2 replicas of `nginx:1.27-alpine`."
+      - text: "The Deployment must become fully ready."
+    setup:
+      - kind: shell
+        desc: create the yamlfix namespace
+        run: kubectl create ns yamlfix
+      - kind: file
+        desc: drop a broken manifest into your working directory
+        path: broken.yaml
+        content: |
+          apiVersion: v1
+          kind: Deployment
+          metadata:
+            name: site
+            namespace: yamlfix
+          spec:
+            replicas: "2"
+            selector:
+              matchLabels:
+                app: web
+            template:
+              metadata:
+                labels:
+                  app: site
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.27-alpine
+    verify:
+      - id: exists
+        desc: Deployment yamlfix/site exists
+        points: 30
+        hint: "kubectl apply -f broken.yaml once it is valid"
+        run: |
+          has deploy site -n yamlfix
+      - id: replicas
+        desc: It asks for 2 replicas of nginx:1.27-alpine
+        points: 30
+        hint: "replicas: 2 and the image tag both matter"
+        run: |
+          eq "$(jp deploy site '{.spec.replicas}' -n yamlfix)" "2" || exit 1
+          eq "$(jp deploy site '{.spec.template.spec.containers[0].image}' -n yamlfix)" "nginx:1.27-alpine"
+      - id: selector
+        desc: The selector and the pod template labels agree
+        points: 20
+        hint: "spec.selector.matchLabels must match spec.template.metadata.labels exactly"
+        run: |
+          a=$(jp deploy site '{.spec.selector.matchLabels.app}' -n yamlfix)
+          b=$(jp deploy site '{.spec.template.metadata.labels.app}' -n yamlfix)
+          [ -n "$a" ] && eq "$a" "$b"
+      - id: ready
+        desc: Both replicas are running
+        points: 20
+        hint: "kubectl -n yamlfix rollout status deploy/site"
+        run: |
+          rollout yamlfix deploy/site 240s || exit 1
+          eq "$(jp deploy site '{.status.readyReplicas}' -n yamlfix)" "2"
+    hints:
+      - title: Where is the file
+        cost: 5
+        text: |
+          The lab shell drops you into a working directory for this attempt.
+          `ls` will show `broken.yaml`. Anything you create there is saved
+          with your attempt, so you can look back at it later.
+
+          If the file is not there, write your own from scratch - that is
+          just as good an exercise.
+      - title: The three mistakes
+        cost: 12
+        text: |
+          1. `apiVersion: v1` - a Deployment lives in `apps/v1`, not the
+             core group
+          2. `replicas: "2"` - a quoted string where a number is expected
+          3. The selector says `app: web` but the pod template labels say
+             `app: site` - they must be identical
+      - title: Checking before applying
+        cost: 8
+        text: |
+          ```
+          kubectl apply --dry-run=client -f broken.yaml
+          kubectl apply --dry-run=server -f broken.yaml
+          ```
+          Client dry-run catches YAML and schema problems. Server dry-run
+          also runs the real validation and admission checks without saving
+          anything - it catches the selector mismatch.
+    solution: |
+      ```bash
+      cat <<'YAML' > site.yaml
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: site
+        namespace: yamlfix
+      spec:
+        replicas: 2
+        selector:
+          matchLabels:
+            app: site
+        template:
+          metadata:
+            labels:
+              app: site
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+      YAML
+
+      kubectl apply --dry-run=client -f site.yaml
+      kubectl apply -f site.yaml
+      kubectl -n yamlfix rollout status deploy/site
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: site, namespace: yamlfix}
+      spec:
+        replicas: 2
+        selector:
+          matchLabels: {app: site}
+        template:
+          metadata:
+            labels: {app: site}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+      YAML
+      kubectl -n yamlfix rollout status deploy/site --timeout=240s
+
+  - id: start-fix-your-first-outage
+    title: Your first outage - a website that will not load
+    difficulty: easy
+    exams: [KCNA, CKA, CKAD]
+    concepts: [troubleshooting, events, describe, images, services]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: A gentle, guided version of what a real on-call ticket feels like.
+    scenario: |
+      "The status page is down." That is the whole ticket. Welcome to
+      operations.
+
+      There is a Deployment called `status` in the `outage` namespace and a
+      Service in front of it, and nothing works. Two things are wrong.
+
+      Work it the way professionals do, from the outside in:
+
+      1. `kubectl -n outage get pods` - are the pods even running?
+      2. `kubectl -n outage describe pod <name>` - if not, the **Events** at
+         the bottom say why
+      3. `kubectl -n outage get endpointslices` - if the pods are fine, can
+         the Service find them?
+
+      Do not guess. Every one of these failures announces itself if you look
+      in the right place.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-application/
+    tasks:
+      - text: "Find out why the `status` pods are not running, and fix it. The correct image is `nginx:1.27-alpine`."
+      - text: "Find out why the Service `status` has no endpoints, and fix it."
+      - text: "Get to a state where the Deployment has 2 ready replicas and the Service has 2 endpoints."
+      - text: "Record what was wrong in a ConfigMap `postmortem` in `outage`: key `fault1` = `image`, key `fault2` = `selector`."
+    setup:
+      - kind: shell
+        desc: deploy a status page with a bad image and a mismatched Service
+        run: |
+          kubectl create ns outage
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: status, namespace: outage}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels: {app: status}
+            template:
+              metadata:
+                labels: {app: status}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.27-alpin
+                    ports: [{containerPort: 80}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: status, namespace: outage}
+          spec:
+            selector: {app: statuspage}
+            ports: [{port: 80, targetPort: 80}]
+          YAML
+          sleep 15
+    verify:
+      - id: image-fixed
+        desc: The Deployment uses a real image tag
+        points: 25
+        hint: "look very carefully at the tag -- kubectl -n outage describe pod says ErrImagePull"
+        run: |
+          eq "$(jp deploy status '{.spec.template.spec.containers[0].image}' -n outage)" "nginx:1.27-alpine"
+      - id: pods-running
+        desc: Two replicas are ready
+        points: 25
+        hint: "kubectl -n outage rollout status deploy/status"
+        run: |
+          rollout outage deploy/status 240s || exit 1
+          eq "$(jp deploy status '{.status.readyReplicas}' -n outage)" "2"
+      - id: selector-fixed
+        desc: The Service selector matches the pods
+        points: 25
+        hint: "compare kubectl -n outage get svc status -o yaml with kubectl -n outage get pods --show-labels"
+        run: |
+          eq "$(jp svc status '{.spec.selector.app}' -n outage)" "status"
+      - id: endpoints
+        desc: The Service has 2 endpoints
+        points: 15
+        hint: "kubectl -n outage get endpointslices"
+        run: |
+          RETRY=25 retry bash -c '
+            n=$(kubectl -n outage get endpointslices -l kubernetes.io/service-name=status \
+              -o jsonpath="{.items[*].endpoints[*].addresses[*]}" | wc -w | tr -d " ")
+            [ "$n" -eq 2 ]'
+      - id: postmortem
+        desc: You wrote down what the two faults were
+        points: 10
+        hint: "kubectl -n outage create configmap postmortem --from-literal=fault1=image --from-literal=fault2=selector"
+        run: |
+          eq "$(jp cm postmortem '{.data.fault1}' -n outage | tr -d ' ')" "image" || exit 1
+          eq "$(jp cm postmortem '{.data.fault2}' -n outage | tr -d ' ')" "selector"
+    hints:
+      - title: Start with the pods
+        cost: 6
+        text: |
+          ```
+          kubectl -n outage get pods
+          ```
+          You will see `ErrImagePull` or `ImagePullBackOff`. That always
+          means the same thing: Kubernetes asked the registry for that image
+          and did not get it.
+      - title: Reading the events
+        cost: 8
+        text: |
+          ```
+          kubectl -n outage describe pod <name> | tail -15
+          ```
+          The Events section at the bottom is the single most useful output
+          in Kubernetes. Here it will name the image it could not pull -
+          look at the tag character by character.
+      - title: Fixing the image
+        cost: 8
+        text: |
+          ```
+          kubectl -n outage set image deploy/status web=nginx:1.27-alpine
+          kubectl -n outage rollout status deploy/status
+          ```
+      - title: The second fault
+        cost: 10
+        text: |
+          Even with healthy pods, a Service only forwards traffic to pods
+          whose labels match its selector:
+
+          ```
+          kubectl -n outage get svc status -o jsonpath='{.spec.selector}'   # app=statuspage
+          kubectl -n outage get pods --show-labels                          # app=status
+          kubectl -n outage patch svc status -p '{"spec":{"selector":{"app":"status"}}}'
+          ```
+          An empty `kubectl get endpointslices` almost always means exactly
+          this.
+    solution: |
+      ```bash
+      kubectl -n outage get pods
+      kubectl -n outage describe pod -l app=status | tail -15    # bad tag: 1.27-alpin
+
+      kubectl -n outage set image deploy/status web=nginx:1.27-alpine
+      kubectl -n outage rollout status deploy/status
+
+      kubectl -n outage get endpointslices                        # empty
+      kubectl -n outage get svc status -o jsonpath='{.spec.selector}'
+      kubectl -n outage get pods --show-labels
+      kubectl -n outage patch svc status -p '{"spec":{"selector":{"app":"status"}}}'
+
+      kubectl -n outage create configmap postmortem \
+        --from-literal=fault1=image --from-literal=fault2=selector
+      ```
+    solve_script: |
+      kubectl -n outage set image deploy/status web=nginx:1.27-alpine
+      kubectl -n outage rollout status deploy/status --timeout=240s
+      kubectl -n outage patch svc status -p '{"spec":{"selector":{"app":"status"}}}'
+      kubectl -n outage create configmap postmortem \
+        --from-literal=fault1=image --from-literal=fault2=selector
+      sleep 8

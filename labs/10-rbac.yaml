@@ -1,0 +1,552 @@
+category: Identity, RBAC & Access Control
+labs:
+
+  - id: rbac-role-binding
+    title: Role and RoleBinding - least privilege in one namespace
+    difficulty: medium
+    exams: [CKA, CKS, KCSA]
+    concepts: [rbac, roles, rolebindings, serviceaccounts, auth can-i]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Grant exactly what is needed, then prove it with kubectl auth can-i.
+    scenario: |
+      RBAC has exactly four objects and one rule: **Role** and
+      **ClusterRole** say *what*; **RoleBinding** and **ClusterRoleBinding**
+      say *who*. Permissions are purely additive - there are no deny rules.
+
+      A CI pipeline runs as a ServiceAccount in the `apps` namespace. It
+      must be able to manage Deployments and read Pods there, and nothing
+      else anywhere.
+
+      `kubectl auth can-i --as` is how you check your work, and it is worth
+      building the habit now - it is far faster than deploying something and
+      seeing whether it breaks.
+    docs:
+      - https://kubernetes.io/docs/reference/access-authn-authz/rbac/
+    tasks:
+      - text: "Create a ServiceAccount `ci-bot` in namespace `apps`."
+      - text: "Create a Role `deploy-manager` in `apps` allowing get, list, watch, create, update, patch and delete on `deployments` in the `apps` API group."
+      - text: "The same Role must allow get, list and watch on `pods` (core group)."
+      - text: "Bind it to `ci-bot` with a RoleBinding called `ci-bot-deploy`."
+      - text: "`ci-bot` must NOT be able to delete pods, or do anything in the `default` namespace."
+    setup:
+      - kind: shell
+        desc: create the apps namespace
+        run: kubectl create ns apps
+    verify:
+      - id: sa
+        desc: ServiceAccount apps/ci-bot exists
+        points: 10
+        hint: "kubectl -n apps create serviceaccount ci-bot"
+        run: |
+          has sa ci-bot -n apps
+      - id: can-manage-deployments
+        desc: ci-bot can create and delete Deployments in apps
+        points: 30
+        hint: "kubectl auth can-i create deployments --as=system:serviceaccount:apps:ci-bot -n apps"
+        run: |
+          for v in get list watch create update patch delete; do
+            kubectl auth can-i $v deployments.apps \
+              --as=system:serviceaccount:apps:ci-bot -n apps 2>/dev/null | grep -qx yes || exit 1
+          done
+      - id: can-read-pods
+        desc: ci-bot can list pods in apps
+        points: 20
+        hint: "a second rule with apiGroups: [\\"\\"] and resources: [pods]"
+        run: |
+          kubectl auth can-i list pods --as=system:serviceaccount:apps:ci-bot -n apps 2>/dev/null | grep -qx yes
+      - id: cannot-delete-pods
+        desc: ci-bot cannot delete pods
+        points: 20
+        hint: "only grant get, list and watch on pods -- not delete"
+        run: |
+          kubectl auth can-i delete pods --as=system:serviceaccount:apps:ci-bot -n apps 2>/dev/null | grep -qx no
+      - id: namespaced-only
+        desc: ci-bot has no access in the default namespace
+        points: 20
+        hint: "a RoleBinding only grants inside its own namespace"
+        run: |
+          kubectl auth can-i list deployments.apps \
+            --as=system:serviceaccount:apps:ci-bot -n default 2>/dev/null | grep -qx no
+      - id: binding
+        desc: A RoleBinding ci-bot-deploy ties the Role to the ServiceAccount
+        points: 0
+        hint: "kubectl -n apps create rolebinding ci-bot-deploy --role=deploy-manager --serviceaccount=apps:ci-bot"
+        run: |
+          eq "$(jp rolebinding ci-bot-deploy '{.roleRef.name}' -n apps)" "deploy-manager" || exit 1
+          jp rolebinding ci-bot-deploy '{.subjects[*].name}' -n apps | grep -q ci-bot
+    hints:
+      - title: The imperative shortcuts
+        cost: 8
+        text: |
+          ```
+          kubectl -n apps create serviceaccount ci-bot
+
+          kubectl -n apps create role deploy-manager \
+            --verb=get,list,watch,create,update,patch,delete \
+            --resource=deployments.apps
+
+          kubectl -n apps create rolebinding ci-bot-deploy \
+            --role=deploy-manager --serviceaccount=apps:ci-bot
+          ```
+      - title: Adding the second rule
+        cost: 10
+        text: |
+          `kubectl create role` only writes one rule. Add the pods rule by
+          editing, or write the whole Role as YAML:
+
+          ```yaml
+          rules:
+            - apiGroups: ["apps"]
+              resources: ["deployments"]
+              verbs: ["get","list","watch","create","update","patch","delete"]
+            - apiGroups: [""]
+              resources: ["pods"]
+              verbs: ["get","list","watch"]
+          ```
+          The core group is the empty string `""`, not `"core"`.
+      - title: Checking as someone else
+        cost: 8
+        text: |
+          ```
+          kubectl auth can-i --list --as=system:serviceaccount:apps:ci-bot -n apps
+          kubectl auth can-i delete pods --as=system:serviceaccount:apps:ci-bot -n apps
+          ```
+          The ServiceAccount username format is always
+          `system:serviceaccount:<namespace>:<name>`.
+    solution: |
+      ```bash
+      kubectl -n apps create serviceaccount ci-bot
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata: {name: deploy-manager, namespace: apps}
+      rules:
+        - apiGroups: ["apps"]
+          resources: ["deployments"]
+          verbs: ["get","list","watch","create","update","patch","delete"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get","list","watch"]
+      YAML
+
+      kubectl -n apps create rolebinding ci-bot-deploy \
+        --role=deploy-manager --serviceaccount=apps:ci-bot
+
+      kubectl auth can-i --list --as=system:serviceaccount:apps:ci-bot -n apps
+      ```
+    solve_script: |
+      kubectl -n apps create serviceaccount ci-bot
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata: {name: deploy-manager, namespace: apps}
+      rules:
+        - apiGroups: ["apps"]
+          resources: ["deployments"]
+          verbs: ["get","list","watch","create","update","patch","delete"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get","list","watch"]
+      YAML
+      kubectl -n apps create rolebinding ci-bot-deploy --role=deploy-manager --serviceaccount=apps:ci-bot
+      sleep 5
+
+  - id: rbac-clusterrole
+    title: ClusterRoles, aggregation and cluster-wide grants
+    difficulty: hard
+    exams: [CKA, CKS]
+    concepts: [clusterrole, clusterrolebinding, aggregation, cluster-scoped resources]
+    par_minutes: 15
+    estimated_minutes: 20
+    blurb: When a Role is not enough, and the trap of binding a ClusterRole in one namespace.
+    scenario: |
+      A Role can never grant access to cluster-scoped resources like Nodes
+      or PersistentVolumes - only a ClusterRole can.
+
+      There is also a subtlety worth internalising: a **ClusterRole** bound
+      by a **RoleBinding** grants those permissions *only inside that
+      namespace*. That combination is how you reuse one ClusterRole
+      definition across many namespaces without granting cluster-wide power.
+
+      Set up a read-only auditor with exactly the right scope, plus an
+      aggregated ClusterRole.
+    docs:
+      - https://kubernetes.io/docs/reference/access-authn-authz/rbac/#aggregated-clusterroles
+    tasks:
+      - text: "Create a ClusterRole `node-reader` allowing get, list and watch on `nodes`."
+      - text: "Create a ServiceAccount `auditor` in namespace `sec` and bind `node-reader` to it cluster-wide with a ClusterRoleBinding `auditor-nodes`."
+      - text: "Create a ClusterRole `ns-reader` allowing get, list and watch on `pods` and `services`."
+      - text: "Bind `ns-reader` to `auditor` with a **RoleBinding** in the `apps` namespace only, called `auditor-apps`."
+      - text: "`auditor` must be able to list nodes, list pods in `apps`, and must NOT be able to list pods in `default`."
+    setup:
+      - kind: shell
+        desc: create the sec and apps namespaces
+        run: |
+          kubectl create ns sec
+          kubectl create ns apps --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: nodes
+        desc: auditor can list nodes cluster-wide
+        points: 30
+        hint: "nodes are cluster-scoped, so this needs a ClusterRole plus a ClusterRoleBinding"
+        run: |
+          kubectl auth can-i list nodes --as=system:serviceaccount:sec:auditor 2>/dev/null | grep -qx yes
+      - id: apps-pods
+        desc: auditor can list pods in the apps namespace
+        points: 25
+        hint: "bind the ns-reader ClusterRole with a RoleBinding inside apps"
+        run: |
+          kubectl auth can-i list pods --as=system:serviceaccount:sec:auditor -n apps 2>/dev/null | grep -qx yes
+      - id: default-denied
+        desc: auditor cannot list pods in the default namespace
+        points: 25
+        hint: "if this fails you used a ClusterRoleBinding where a RoleBinding was wanted"
+        run: |
+          kubectl auth can-i list pods --as=system:serviceaccount:sec:auditor -n default 2>/dev/null | grep -qx no
+      - id: read-only
+        desc: auditor cannot delete anything
+        points: 20
+        hint: "only grant get, list and watch"
+        run: |
+          kubectl auth can-i delete pods --as=system:serviceaccount:sec:auditor -n apps 2>/dev/null | grep -qx no || exit 1
+          kubectl auth can-i delete nodes --as=system:serviceaccount:sec:auditor 2>/dev/null | grep -qx no
+    hints:
+      - title: The two ClusterRoles
+        cost: 10
+        text: |
+          ```
+          kubectl create clusterrole node-reader \
+            --verb=get,list,watch --resource=nodes
+
+          kubectl create clusterrole ns-reader \
+            --verb=get,list,watch --resource=pods,services
+          ```
+      - title: The two different bindings
+        cost: 12
+        text: |
+          ```
+          # cluster-wide
+          kubectl create clusterrolebinding auditor-nodes \
+            --clusterrole=node-reader --serviceaccount=sec:auditor
+
+          # namespace-scoped, using the same kind of ClusterRole
+          kubectl -n apps create rolebinding auditor-apps \
+            --clusterrole=ns-reader --serviceaccount=sec:auditor
+          ```
+          Note `--clusterrole` on a *rolebinding*. That is the reuse pattern.
+      - title: The mental model
+        cost: 10
+        text: |
+          - Role + RoleBinding: namespaced permissions, namespaced grant
+          - ClusterRole + ClusterRoleBinding: cluster-wide everything
+          - ClusterRole + RoleBinding: the ClusterRole's rules, but only in
+            the binding's namespace
+          - Role + ClusterRoleBinding: not allowed
+    solution: |
+      ```bash
+      kubectl -n sec create serviceaccount auditor
+
+      kubectl create clusterrole node-reader --verb=get,list,watch --resource=nodes
+      kubectl create clusterrolebinding auditor-nodes \
+        --clusterrole=node-reader --serviceaccount=sec:auditor
+
+      kubectl create clusterrole ns-reader --verb=get,list,watch --resource=pods,services
+      kubectl -n apps create rolebinding auditor-apps \
+        --clusterrole=ns-reader --serviceaccount=sec:auditor
+
+      kubectl auth can-i list nodes --as=system:serviceaccount:sec:auditor
+      kubectl auth can-i list pods  --as=system:serviceaccount:sec:auditor -n apps
+      kubectl auth can-i list pods  --as=system:serviceaccount:sec:auditor -n default
+      ```
+    solve_script: |
+      kubectl -n sec create serviceaccount auditor
+      kubectl create clusterrole node-reader --verb=get,list,watch --resource=nodes
+      kubectl create clusterrolebinding auditor-nodes --clusterrole=node-reader --serviceaccount=sec:auditor
+      kubectl create clusterrole ns-reader --verb=get,list,watch --resource=pods,services
+      kubectl -n apps create rolebinding auditor-apps --clusterrole=ns-reader --serviceaccount=sec:auditor
+      sleep 5
+
+  - id: rbac-serviceaccount-tokens
+    title: ServiceAccount tokens - projection, mounting and turning it off
+    difficulty: hard
+    exams: [CKS, CKA, KCSA]
+    concepts: [serviceaccounts, tokens, automountServiceAccountToken, projected volumes]
+    par_minutes: 15
+    estimated_minutes: 20
+    blurb: Every pod gets an API credential by default. Most pods should not have one.
+    scenario: |
+      By default every pod gets a ServiceAccount token mounted at
+      `/var/run/secrets/kubernetes.io/serviceaccount/`. If an attacker gets
+      code execution in that pod, they get an API credential for free.
+
+      Modern Kubernetes uses short-lived *projected* tokens rather than
+      long-lived Secrets, which is a big improvement - but the right answer
+      for a workload that never calls the API is still to not mount one at
+      all.
+
+      Configure both halves: a pod that legitimately needs a token, and one
+      that must not have one.
+    docs:
+      - https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
+      - https://kubernetes.io/docs/concepts/security/service-accounts/
+    tasks:
+      - text: "In namespace `tokens`, create a ServiceAccount `api-caller` with `automountServiceAccountToken: true`."
+      - text: "Create a ServiceAccount `no-api` with `automountServiceAccountToken: false`."
+      - text: "Create Pod `caller` using `api-caller` - it must have a token mounted."
+      - text: "Create Pod `quiet` using `no-api` - it must have NO token mounted."
+      - text: "Create a short-lived token for `api-caller` with `kubectl create token` and record its expiry seconds in ConfigMap `tokeninfo` (key `ttl`, use 600)."
+    setup:
+      - kind: shell
+        desc: create the tokens namespace
+        run: kubectl create ns tokens
+    verify:
+      - id: sas
+        desc: Both ServiceAccounts exist with the right automount setting
+        points: 25
+        hint: "automountServiceAccountToken is a top-level field on the ServiceAccount"
+        run: |
+          eq "$(jp sa api-caller '{.automountServiceAccountToken}' -n tokens)" "true" || exit 1
+          eq "$(jp sa no-api '{.automountServiceAccountToken}' -n tokens)" "false"
+      - id: caller-has-token
+        desc: The caller pod has a mounted ServiceAccount token
+        points: 25
+        hint: "kubectl -n tokens exec caller -- ls /var/run/secrets/kubernetes.io/serviceaccount"
+        run: |
+          retry bash -c 'kubectl -n tokens get pod caller -o jsonpath="{.status.phase}" | grep -q Running'
+          eq "$(jp pod caller '{.spec.serviceAccountName}' -n tokens)" "api-caller" || exit 1
+          kubectl -n tokens exec caller -- cat /var/run/secrets/kubernetes.io/serviceaccount/token >/dev/null 2>&1
+      - id: quiet-has-none
+        desc: The quiet pod has no token mounted at all
+        points: 30
+        hint: "with automount disabled the directory does not exist inside the container"
+        run: |
+          retry bash -c 'kubectl -n tokens get pod quiet -o jsonpath="{.status.phase}" | grep -q Running'
+          eq "$(jp pod quiet '{.spec.serviceAccountName}' -n tokens)" "no-api" || exit 1
+          if kubectl -n tokens exec quiet -- cat /var/run/secrets/kubernetes.io/serviceaccount/token >/dev/null 2>&1; then
+            echo "a token is still mounted in quiet" >&2
+            exit 1
+          fi
+          exit 0
+      - id: ttl
+        desc: You recorded the short-lived token TTL
+        points: 20
+        hint: "kubectl -n tokens create token api-caller --duration=600s"
+        run: |
+          eq "$(jp cm tokeninfo '{.data.ttl}' -n tokens | tr -d ' ')" "600"
+    hints:
+      - title: Creating the ServiceAccounts
+        cost: 8
+        text: |
+          ```
+          kubectl -n tokens create sa api-caller
+          kubectl -n tokens create sa no-api
+          kubectl -n tokens patch sa api-caller -p '{"automountServiceAccountToken":true}'
+          kubectl -n tokens patch sa no-api     -p '{"automountServiceAccountToken":false}'
+          ```
+      - title: Two places automount can be set
+        cost: 10
+        text: |
+          On the ServiceAccount (applies to every pod using it) or on the
+          pod itself:
+
+          ```yaml
+          spec:
+            serviceAccountName: no-api
+            automountServiceAccountToken: false
+          ```
+          The pod-level setting wins when both are present.
+      - title: Short-lived tokens
+        cost: 8
+        text: |
+          ```
+          kubectl -n tokens create token api-caller --duration=600s
+          ```
+          This asks the TokenRequest API for a bound, expiring token -
+          the modern replacement for the old non-expiring
+          `kubernetes.io/service-account-token` Secrets.
+    solution: |
+      ```bash
+      kubectl -n tokens create sa api-caller
+      kubectl -n tokens create sa no-api
+      kubectl -n tokens patch sa api-caller -p '{"automountServiceAccountToken":true}'
+      kubectl -n tokens patch sa no-api     -p '{"automountServiceAccountToken":false}'
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: caller, namespace: tokens}
+      spec:
+        serviceAccountName: api-caller
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: quiet, namespace: tokens}
+      spec:
+        serviceAccountName: no-api
+        automountServiceAccountToken: false
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+      YAML
+
+      kubectl -n tokens create token api-caller --duration=600s
+      kubectl -n tokens create configmap tokeninfo --from-literal=ttl=600
+      ```
+    solve_script: |
+      kubectl -n tokens create sa api-caller
+      kubectl -n tokens create sa no-api
+      kubectl -n tokens patch sa api-caller -p '{"automountServiceAccountToken":true}'
+      kubectl -n tokens patch sa no-api -p '{"automountServiceAccountToken":false}'
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: caller, namespace: tokens}
+      spec:
+        serviceAccountName: api-caller
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: quiet, namespace: tokens}
+      spec:
+        serviceAccountName: no-api
+        automountServiceAccountToken: false
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+      YAML
+      kubectl -n tokens wait --for=condition=Ready pod/caller pod/quiet --timeout=180s
+      kubectl -n tokens create token api-caller --duration=600s >/dev/null
+      kubectl -n tokens create configmap tokeninfo --from-literal=ttl=600
+
+  - id: rbac-audit-permissions
+    title: Audit an over-privileged cluster and cut it back
+    difficulty: hard
+    exams: [CKS, KCSA, CKA]
+    concepts: [rbac, least privilege, cluster-admin, privilege escalation, auditing]
+    par_minutes: 17
+    estimated_minutes: 22
+    blurb: Someone bound cluster-admin to a bot. Find it, understand the blast radius, fix it.
+    scenario: |
+      A previous engineer "fixed a permissions problem" by binding
+      `cluster-admin` to a ServiceAccount. That ServiceAccount runs a
+      log-shipping DaemonSet that only ever needs to read pods.
+
+      Anyone who compromises that pod owns the cluster - including the
+      ability to read every Secret and to grant themselves more access.
+
+      Find the offending binding, remove it, and replace it with the
+      minimum that actually works.
+    docs:
+      - https://kubernetes.io/docs/reference/access-authn-authz/rbac/#privilege-escalation-prevention-and-bootstrapping
+    tasks:
+      - text: "Find and delete the ClusterRoleBinding that grants `cluster-admin` to the `logger` ServiceAccount in `logging`."
+      - text: "Create a ClusterRole `pod-reader-min` allowing only get, list and watch on `pods` and `namespaces`."
+      - text: "Bind it to `logging:logger` with a ClusterRoleBinding named `logger-read`."
+      - text: "`logger` must be able to list pods cluster-wide, and must NOT be able to read Secrets or create RoleBindings."
+      - text: "Record the name of the dangerous binding you removed in ConfigMap `auditinfo` in `logging`, key `removed`."
+    setup:
+      - kind: shell
+        desc: create an over-privileged log shipper
+        run: |
+          kubectl create ns logging
+          kubectl -n logging create serviceaccount logger
+          kubectl create clusterrolebinding logger-is-admin \
+            --clusterrole=cluster-admin --serviceaccount=logging:logger
+    verify:
+      - id: removed
+        desc: The cluster-admin binding is gone
+        points: 30
+        hint: "kubectl get clusterrolebindings -o wide | grep logger"
+        run: |
+          ! kubectl get clusterrolebinding logger-is-admin >/dev/null 2>&1
+      - id: no-secrets
+        desc: logger can no longer read Secrets
+        points: 25
+        hint: "kubectl auth can-i get secrets --as=system:serviceaccount:logging:logger -A"
+        run: |
+          kubectl auth can-i get secrets --as=system:serviceaccount:logging:logger -A 2>/dev/null | grep -qx no
+      - id: no-escalation
+        desc: logger cannot create RoleBindings (no privilege escalation path)
+        points: 20
+        hint: "the ability to create bindings is the ability to grant yourself anything"
+        run: |
+          kubectl auth can-i create rolebindings.rbac.authorization.k8s.io \
+            --as=system:serviceaccount:logging:logger -A 2>/dev/null | grep -qx no
+      - id: still-works
+        desc: logger can still list pods cluster-wide
+        points: 25
+        hint: "kubectl create clusterrole pod-reader-min --verb=get,list,watch --resource=pods,namespaces"
+        run: |
+          kubectl auth can-i list pods --as=system:serviceaccount:logging:logger -A 2>/dev/null | grep -qx yes || exit 1
+          eq "$(jp clusterrolebinding logger-read '{.roleRef.name}')" "pod-reader-min"
+      - id: recorded
+        desc: You recorded which binding you removed
+        points: 0
+        hint: "kubectl -n logging create configmap auditinfo --from-literal=removed=logger-is-admin"
+        run: |
+          eq "$(jp cm auditinfo '{.data.removed}' -n logging | tr -d ' ')" "logger-is-admin"
+    hints:
+      - title: Finding dangerous bindings
+        cost: 10
+        text: |
+          ```
+          kubectl get clusterrolebindings -o custom-columns=\
+          NAME:.metadata.name,ROLE:.roleRef.name,SUBJECTS:.subjects[*].name \
+            | grep -i cluster-admin
+          ```
+          Anything binding `cluster-admin` to a non-human subject deserves a
+          conversation.
+      - title: What can this identity do
+        cost: 10
+        text: |
+          ```
+          kubectl auth can-i --list --as=system:serviceaccount:logging:logger
+          ```
+          Run it before and after your change - the difference is the whole
+          point of the exercise.
+      - title: The replacement
+        cost: 10
+        text: |
+          ```
+          kubectl delete clusterrolebinding logger-is-admin
+
+          kubectl create clusterrole pod-reader-min \
+            --verb=get,list,watch --resource=pods,namespaces
+
+          kubectl create clusterrolebinding logger-read \
+            --clusterrole=pod-reader-min --serviceaccount=logging:logger
+          ```
+    solution: |
+      ```bash
+      kubectl get clusterrolebindings -o wide | grep logger
+      kubectl auth can-i --list --as=system:serviceaccount:logging:logger | head
+
+      kubectl delete clusterrolebinding logger-is-admin
+
+      kubectl create clusterrole pod-reader-min --verb=get,list,watch --resource=pods,namespaces
+      kubectl create clusterrolebinding logger-read \
+        --clusterrole=pod-reader-min --serviceaccount=logging:logger
+
+      kubectl auth can-i get secrets --as=system:serviceaccount:logging:logger -A   # no
+      kubectl auth can-i list pods   --as=system:serviceaccount:logging:logger -A   # yes
+
+      kubectl -n logging create configmap auditinfo --from-literal=removed=logger-is-admin
+      ```
+    solve_script: |
+      kubectl delete clusterrolebinding logger-is-admin
+      kubectl create clusterrole pod-reader-min --verb=get,list,watch --resource=pods,namespaces
+      kubectl create clusterrolebinding logger-read --clusterrole=pod-reader-min --serviceaccount=logging:logger
+      kubectl -n logging create configmap auditinfo --from-literal=removed=logger-is-admin
+      sleep 5

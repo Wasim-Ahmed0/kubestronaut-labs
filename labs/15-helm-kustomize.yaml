@@ -1,0 +1,560 @@
+category: Helm & Kustomize
+labs:
+
+  - id: pkg-helm-basics
+    title: Helm - install, upgrade, rollback, uninstall
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [helm, charts, releases, values, repositories]
+    par_minutes: 15
+    estimated_minutes: 20
+    requires_tools: [helm]
+    blurb: The package manager the whole ecosystem ships with. Learn the release lifecycle.
+    scenario: |
+      Helm packages a set of manifests as a **chart**, and an installed
+      instance of a chart is a **release**. Helm renders the chart's
+      templates with your **values** and applies the result, keeping a
+      revision history so you can roll back.
+
+      The mental model that saves you: Helm is a template engine plus a
+      record of what it applied. Nothing magic is happening in the cluster -
+      `helm get manifest` shows you the plain YAML it produced.
+
+      helm is already on your PATH in this lab shell.
+    docs:
+      - https://helm.sh/docs/intro/using_helm/
+      - https://kubernetes.io/docs/concepts/cluster-administration/manage-deployment/
+    tasks:
+      - text: "Add the Bitnami repository (`https://charts.bitnami.com/bitnami`) as `bitnami` and update your repo cache."
+      - text: "Create a local chart with `helm create` called `webapp` in your working directory."
+      - text: "Install it into namespace `helmlab` as release `site`, overriding `replicaCount` to 2 and `image.tag` to `1.27-alpine`."
+      - text: "Upgrade the release to `replicaCount=3`, then roll back to revision 1."
+      - text: "The release must end at revision 3, deployed, with 2 replicas (because revision 1 had 2)."
+    setup:
+      - kind: shell
+        desc: create the helmlab namespace
+        run: kubectl create ns helmlab
+    verify:
+      - id: repo
+        desc: The bitnami repository is configured
+        points: 15
+        hint: "helm repo add bitnami https://charts.bitnami.com/bitnami"
+        run: |
+          helm repo list 2>/dev/null | grep -q bitnami
+      - id: installed
+        desc: A Helm release called site exists in helmlab and is deployed
+        points: 30
+        hint: "helm -n helmlab install site ./webapp --set replicaCount=2"
+        run: |
+          helm -n helmlab status site >/dev/null 2>&1 || exit 1
+          helm -n helmlab list -o json 2>/dev/null | grep -q '"status":"deployed"'
+      - id: rolled-back
+        desc: The release is at revision 3 after upgrade and rollback
+        points: 30
+        hint: "helm -n helmlab rollback site 1 -- a rollback creates a NEW revision"
+        run: |
+          rev=$(helm -n helmlab list -o json 2>/dev/null \
+                | tr ',' '\n' | grep '"revision"' | head -1 | tr -dc '0-9')
+          [ "${rev:-0}" -ge 3 ]
+      - id: replicas
+        desc: The deployed workload is back to 2 replicas
+        points: 25
+        hint: "rolling back to revision 1 restores the values revision 1 was installed with"
+        run: |
+          d=$(kubectl -n helmlab get deploy -o name | head -1)
+          [ -n "$d" ] || exit 1
+          RETRY=30 retry bash -c "[ \"\$(kubectl -n helmlab get $d -o jsonpath='{.spec.replicas}')\" = '2' ]"
+    hints:
+      - title: Repos and charts
+        cost: 8
+        text: |
+          ```
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+          helm search repo bitnami/nginx | head
+          helm create webapp          # scaffolds a chart in ./webapp
+          ```
+      - title: The release lifecycle
+        cost: 10
+        text: |
+          ```
+          helm -n helmlab install site ./webapp \
+            --set replicaCount=2 --set image.tag=1.27-alpine
+
+          helm -n helmlab list
+          helm -n helmlab history site
+
+          helm -n helmlab upgrade site ./webapp --set replicaCount=3 --reuse-values
+          helm -n helmlab rollback site 1
+          ```
+      - title: Rollback creates a new revision
+        cost: 10
+        text: |
+          `helm rollback site 1` does not rewind the counter - it applies
+          revision 1's content as a *new* revision 3. `helm history site`
+          shows all of it, which is what makes Helm auditable.
+      - title: Seeing what Helm actually applied
+        cost: 8
+        text: |
+          ```
+          helm -n helmlab get manifest site | head -40
+          helm -n helmlab get values site
+          helm template ./webapp --set replicaCount=2      # render without installing
+          ```
+          `helm template` is the one to reach for when a chart does
+          something surprising.
+    solution: |
+      ```bash
+      helm repo add bitnami https://charts.bitnami.com/bitnami
+      helm repo update
+
+      helm create webapp
+
+      helm -n helmlab install site ./webapp \
+        --set replicaCount=2 --set image.tag=1.27-alpine
+      helm -n helmlab upgrade site ./webapp \
+        --set replicaCount=3 --set image.tag=1.27-alpine
+      helm -n helmlab rollback site 1
+
+      helm -n helmlab history site
+      kubectl -n helmlab get deploy
+      ```
+    solve_script: |
+      helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null 2>&1 || true
+      helm repo update >/dev/null 2>&1 || true
+      cd "$(mktemp -d)"
+      helm create webapp >/dev/null
+      helm -n helmlab install site ./webapp --set replicaCount=2 --set image.tag=1.27-alpine --wait --timeout=300s
+      helm -n helmlab upgrade site ./webapp --set replicaCount=3 --set image.tag=1.27-alpine --wait --timeout=300s
+      helm -n helmlab rollback site 1 --wait --timeout=300s
+
+  - id: pkg-helm-values
+    title: Chart values, templates and debugging a rendered manifest
+    difficulty: hard
+    exams: [CKAD, CKA]
+    concepts: [helm, templates, values files, helm template, chart structure]
+    par_minutes: 16
+    estimated_minutes: 21
+    requires_tools: [helm]
+    blurb: Write your own tiny chart so charts stop being a black box.
+    scenario: |
+      A chart is just a directory:
+
+      ```
+      mychart/
+        Chart.yaml          name, version, appVersion
+        values.yaml         the defaults
+        templates/          Go-templated manifests
+      ```
+
+      Templates use `{{ .Values.something }}` to pull from values.yaml, and
+      `helm template` renders them so you can see exactly what would be
+      applied.
+
+      Build a minimal chart by hand - once you have done it once, every
+      other chart becomes readable.
+    docs:
+      - https://helm.sh/docs/chart_template_guide/
+    tasks:
+      - text: "In your working directory, create a chart directory `mini` with `Chart.yaml`, `values.yaml` and `templates/deployment.yaml`."
+      - text: "values.yaml must default `replicaCount` to 1 and `image` to `nginx:1.27-alpine`."
+      - text: "The template must render a Deployment named after the release, using those values."
+      - text: "Install it into namespace `mini` as release `demo` with `replicaCount=3`, and get it fully ready."
+    setup:
+      - kind: shell
+        desc: create the mini namespace
+        run: kubectl create ns mini
+    verify:
+      - id: release
+        desc: Helm release demo is deployed in the mini namespace
+        points: 30
+        hint: "helm -n mini install demo ./mini --set replicaCount=3"
+        run: |
+          helm -n mini status demo >/dev/null 2>&1
+      - id: deployment
+        desc: A Deployment exists in mini with 3 ready replicas
+        points: 35
+        hint: "your template must actually use .Values.replicaCount"
+        run: |
+          d=$(kubectl -n mini get deploy -o name | head -1)
+          [ -n "$d" ] || exit 1
+          RETRY=30 retry bash -c "[ \"\$(kubectl -n mini get $d -o jsonpath='{.spec.replicas}')\" = '3' ]" || exit 1
+          RETRY=40 retry bash -c "[ \"\$(kubectl -n mini get $d -o jsonpath='{.status.readyReplicas}')\" = '3' ]"
+      - id: image
+        desc: It runs the image from values.yaml
+        points: 20
+        hint: "{{ .Values.image }} in the container spec"
+        run: |
+          kubectl -n mini get deploy -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' \
+            | grep -q 'nginx:1.27-alpine'
+      - id: managed-by-helm
+        desc: The Deployment is genuinely Helm-managed, not hand-applied
+        points: 15
+        hint: "Helm stamps app.kubernetes.io/managed-by=Helm onto what it applies"
+        run: |
+          kubectl -n mini get deploy -o jsonpath='{.items[0].metadata.labels}' \
+            | grep -qi 'helm' || \
+          kubectl -n mini get deploy -o jsonpath='{.items[0].metadata.annotations}' \
+            | grep -q 'meta.helm.sh/release-name'
+    hints:
+      - title: Chart.yaml
+        cost: 8
+        text: |
+          ```yaml
+          apiVersion: v2
+          name: mini
+          description: a tiny chart
+          type: application
+          version: 0.1.0
+          appVersion: "1.0"
+          ```
+          `version` is the chart's own version; `appVersion` is the software
+          it installs. Both are required.
+      - title: values.yaml and the template
+        cost: 12
+        text: |
+          `values.yaml`:
+          ```yaml
+          replicaCount: 1
+          image: nginx:1.27-alpine
+          ```
+
+          `templates/deployment.yaml`:
+          ```yaml
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: {{ .Release.Name }}
+          spec:
+            replicas: {{ .Values.replicaCount }}
+            selector:
+              matchLabels:
+                app: {{ .Release.Name }}
+            template:
+              metadata:
+                labels:
+                  app: {{ .Release.Name }}
+              spec:
+                containers:
+                  - name: app
+                    image: {{ .Values.image }}
+          ```
+      - title: Render before you install
+        cost: 10
+        text: |
+          ```
+          helm template demo ./mini --set replicaCount=3
+          helm lint ./mini
+          helm -n mini install demo ./mini --set replicaCount=3 --dry-run
+          ```
+          `helm template` catches template errors instantly and shows you
+          the exact YAML - always do this before installing.
+      - title: Built-in objects worth knowing
+        cost: 10
+        text: |
+          - `.Release.Name`, `.Release.Namespace`, `.Release.Revision`
+          - `.Chart.Name`, `.Chart.Version`, `.Chart.AppVersion`
+          - `.Values.<anything from values.yaml>`
+          - `.Capabilities.KubeVersion` - for version-conditional templates
+    solution: |
+      ```bash
+      mkdir -p mini/templates
+
+      cat <<'YAML' > mini/Chart.yaml
+      apiVersion: v2
+      name: mini
+      description: a tiny chart
+      type: application
+      version: 0.1.0
+      appVersion: "1.0"
+      YAML
+
+      cat <<'YAML' > mini/values.yaml
+      replicaCount: 1
+      image: nginx:1.27-alpine
+      YAML
+
+      cat <<'YAML' > mini/templates/deployment.yaml
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: {{ .Release.Name }}
+      spec:
+        replicas: {{ .Values.replicaCount }}
+        selector:
+          matchLabels:
+            app: {{ .Release.Name }}
+        template:
+          metadata:
+            labels:
+              app: {{ .Release.Name }}
+          spec:
+            containers:
+              - name: app
+                image: {{ .Values.image }}
+      YAML
+
+      helm template demo ./mini --set replicaCount=3
+      helm -n mini install demo ./mini --set replicaCount=3
+      ```
+    solve_script: |
+      D=$(mktemp -d); cd "$D"
+      mkdir -p mini/templates
+      cat > mini/Chart.yaml <<'YAML'
+      apiVersion: v2
+      name: mini
+      description: a tiny chart
+      type: application
+      version: 0.1.0
+      appVersion: "1.0"
+      YAML
+      cat > mini/values.yaml <<'YAML'
+      replicaCount: 1
+      image: nginx:1.27-alpine
+      YAML
+      cat > mini/templates/deployment.yaml <<'YAML'
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: {{ .Release.Name }}
+      spec:
+        replicas: {{ .Values.replicaCount }}
+        selector:
+          matchLabels:
+            app: {{ .Release.Name }}
+        template:
+          metadata:
+            labels:
+              app: {{ .Release.Name }}
+          spec:
+            containers:
+              - name: app
+                image: {{ .Values.image }}
+      YAML
+      helm -n mini install demo ./mini --set replicaCount=3 --wait --timeout=300s
+
+  - id: pkg-kustomize
+    title: Kustomize - one base, many environments, no templating
+    difficulty: medium
+    exams: [CKAD, CKA]
+    concepts: [kustomize, overlays, patches, kubectl apply -k, configMapGenerator]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: Built into kubectl. Plain YAML plus declarative overlays instead of templates.
+    scenario: |
+      Kustomize takes the opposite approach to Helm: no templating language
+      at all. You keep a **base** of ordinary manifests and layer
+      **overlays** that patch them per environment.
+
+      It is built into kubectl (`kubectl apply -k`, `kubectl kustomize`), so
+      there is nothing to install and it is fair game in the exams.
+
+      Build a base and a production overlay that bumps replicas, adds a name
+      prefix, sets a common label and generates a ConfigMap.
+    docs:
+      - https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/
+    tasks:
+      - text: "In your working directory create `base/` with a `deployment.yaml` (Deployment `app`, 1 replica, `nginx:1.27-alpine`) and a `kustomization.yaml` listing it."
+      - text: "Create `overlays/prod/kustomization.yaml` that references the base, sets namePrefix `prod-`, adds the common label `env=prod`, and patches replicas to 4."
+      - text: "It must also generate a ConfigMap named `settings` with `LOG_LEVEL=warn`."
+      - text: "Apply the prod overlay into namespace `kust` and get `prod-app` fully ready."
+    setup:
+      - kind: shell
+        desc: create the kust namespace
+        run: kubectl create ns kust
+    verify:
+      - id: deployed
+        desc: Deployment kust/prod-app exists with 4 ready replicas
+        points: 35
+        hint: "namePrefix: prod- turns app into prod-app"
+        run: |
+          eq "$(jp deploy prod-app '{.spec.replicas}' -n kust)" "4" || exit 1
+          RETRY=40 retry bash -c '[ "$(kubectl -n kust get deploy prod-app -o jsonpath="{.status.readyReplicas}")" = "4" ]'
+      - id: label
+        desc: The common label env=prod was applied
+        points: 25
+        hint: "labels: with includeSelectors, or the older commonLabels:"
+        run: |
+          eq "$(jp deploy prod-app '{.metadata.labels.env}' -n kust)" "prod"
+      - id: configmap
+        desc: A generated ConfigMap carries LOG_LEVEL=warn
+        points: 25
+        hint: "configMapGenerator adds a content hash suffix to the name"
+        run: |
+          kubectl -n kust get cm -o jsonpath='{range .items[*]}{.metadata.name}={.data.LOG_LEVEL}{"\n"}{end}' \
+            | grep -E '^prod-settings' | grep -q 'warn'
+      - id: image
+        desc: The base image came through unchanged
+        points: 15
+        hint: "the overlay only patches what you tell it to"
+        run: |
+          eq "$(jp deploy prod-app '{.spec.template.spec.containers[0].image}' -n kust)" "nginx:1.27-alpine"
+    hints:
+      - title: The base
+        cost: 10
+        text: |
+          `base/deployment.yaml` is an ordinary manifest. `base/kustomization.yaml`:
+
+          ```yaml
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - deployment.yaml
+          ```
+      - title: The overlay
+        cost: 12
+        text: |
+          ```yaml
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: kust
+          resources:
+            - ../../base
+          namePrefix: prod-
+          labels:
+            - pairs:
+                env: prod
+              includeSelectors: false
+          configMapGenerator:
+            - name: settings
+              literals:
+                - LOG_LEVEL=warn
+          patches:
+            - target:
+                kind: Deployment
+                name: app
+              patch: |-
+                - op: replace
+                  path: /spec/replicas
+                  value: 4
+          ```
+      - title: Render before applying
+        cost: 8
+        text: |
+          ```
+          kubectl kustomize overlays/prod          # print the result
+          kubectl apply -k overlays/prod           # apply it
+          ```
+          Always look at the render first - it is the single best way to
+          understand what an overlay is doing.
+      - title: The generator name suffix
+        cost: 8
+        text: |
+          `configMapGenerator` appends a hash of the content to the name, so
+          you get `prod-settings-7b2h4kf9td`. That is deliberate: changing
+          the content changes the name, which forces a rolling update of
+          anything referencing it. Set `generatorOptions.disableNameSuffixHash: true`
+          to turn it off.
+    solution: |
+      ```bash
+      mkdir -p base overlays/prod
+
+      cat <<'YAML' > base/deployment.yaml
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: app
+        template:
+          metadata:
+            labels:
+              app: app
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+      YAML
+
+      cat <<'YAML' > base/kustomization.yaml
+      apiVersion: kustomize.config.k8s.io/v1beta1
+      kind: Kustomization
+      resources:
+        - deployment.yaml
+      YAML
+
+      cat <<'YAML' > overlays/prod/kustomization.yaml
+      apiVersion: kustomize.config.k8s.io/v1beta1
+      kind: Kustomization
+      namespace: kust
+      resources:
+        - ../../base
+      namePrefix: prod-
+      labels:
+        - pairs:
+            env: prod
+          includeSelectors: false
+      configMapGenerator:
+        - name: settings
+          literals:
+            - LOG_LEVEL=warn
+      patches:
+        - target:
+            kind: Deployment
+            name: app
+          patch: |-
+            - op: replace
+              path: /spec/replicas
+              value: 4
+      YAML
+
+      kubectl kustomize overlays/prod
+      kubectl apply -k overlays/prod
+      ```
+    solve_script: |
+      D=$(mktemp -d); cd "$D"
+      mkdir -p base overlays/prod
+      cat > base/deployment.yaml <<'YAML'
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: app
+        template:
+          metadata:
+            labels:
+              app: app
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+      YAML
+      cat > base/kustomization.yaml <<'YAML'
+      apiVersion: kustomize.config.k8s.io/v1beta1
+      kind: Kustomization
+      resources:
+        - deployment.yaml
+      YAML
+      cat > overlays/prod/kustomization.yaml <<'YAML'
+      apiVersion: kustomize.config.k8s.io/v1beta1
+      kind: Kustomization
+      namespace: kust
+      resources:
+        - ../../base
+      namePrefix: prod-
+      labels:
+        - pairs:
+            env: prod
+          includeSelectors: false
+      configMapGenerator:
+        - name: settings
+          literals:
+            - LOG_LEVEL=warn
+      patches:
+        - target:
+            kind: Deployment
+            name: app
+          patch: |-
+            - op: replace
+              path: /spec/replicas
+              value: 4
+      YAML
+      kubectl apply -k overlays/prod
+      kubectl -n kust rollout status deploy/prod-app --timeout=300s

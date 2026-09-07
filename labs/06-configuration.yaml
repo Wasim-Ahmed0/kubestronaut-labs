@@ -1,0 +1,837 @@
+category: Configuration & Resource Governance
+labs:
+
+  - id: cfg-configmaps
+    title: ConfigMaps as env vars and as files
+    difficulty: easy
+    exams: [KCNA, CKA, CKAD]
+    concepts: [configmaps, env vars, envFrom, volumes]
+    par_minutes: 11
+    estimated_minutes: 14
+    blurb: The three ways config reaches a container, and when each one is right.
+    scenario: |
+      Configuration should not be baked into images. A ConfigMap can reach a
+      container three ways:
+
+      - one key as one env var (`valueFrom.configMapKeyRef`)
+      - every key as env vars (`envFrom`)
+      - the whole map as a directory of files (a `configMap` volume)
+
+      The third is the one that supports live updates - files in a mounted
+      ConfigMap change when the ConfigMap changes, env vars never do.
+
+      Build a pod that uses all three.
+    docs:
+      - https://kubernetes.io/docs/concepts/configuration/configmap/
+      - https://kubernetes.io/docs/tasks/configure-pod-container/configure-pod-configmap/
+    tasks:
+      - text: "In namespace `conf`, create a ConfigMap `app-settings` with `LOG_LEVEL=debug` and `REGION=eu-west-1`."
+      - text: "Create a ConfigMap `app-files` from a literal key `nginx.conf` whose value is `server { listen 8080; }`."
+      - text: "Create a Pod `configured` (`busybox:1.36`, `sleep 3600`) with env var `LEVEL` taken from `app-settings` key `LOG_LEVEL`."
+      - text: "Also pull every key of `app-settings` in as env vars using `envFrom`."
+      - text: "Also mount `app-files` as a volume at `/etc/appconf`."
+    setup:
+      - kind: shell
+        desc: create the conf namespace
+        run: kubectl create ns conf
+    verify:
+      - id: cms
+        desc: Both ConfigMaps exist with the right keys
+        points: 20
+        hint: "kubectl -n conf create configmap app-settings --from-literal=LOG_LEVEL=debug --from-literal=REGION=eu-west-1"
+        run: |
+          eq "$(jp cm app-settings '{.data.LOG_LEVEL}' -n conf)" "debug" || exit 1
+          eq "$(jp cm app-settings '{.data.REGION}' -n conf)" "eu-west-1" || exit 1
+          jp cm app-files '{.data.nginx\.conf}' -n conf | grep -q 'listen 8080'
+      - id: single-env
+        desc: LEVEL comes from the LOG_LEVEL key of app-settings
+        points: 25
+        hint: "env: [{name: LEVEL, valueFrom: {configMapKeyRef: {name: app-settings, key: LOG_LEVEL}}}]"
+        run: |
+          retry bash -c 'kubectl -n conf get pod configured -o jsonpath="{.status.phase}" | grep -q Running'
+          eq "$(kubectl -n conf exec configured -- sh -c 'echo $LEVEL' 2>/dev/null | tr -d '\r')" "debug"
+      - id: envfrom
+        desc: REGION arrived through envFrom
+        points: 25
+        hint: "envFrom: [{configMapRef: {name: app-settings}}]"
+        run: |
+          jp pod configured '{.spec.containers[0].envFrom[0].configMapRef.name}' -n conf | grep -q app-settings || exit 1
+          eq "$(kubectl -n conf exec configured -- sh -c 'echo $REGION' 2>/dev/null | tr -d '\r')" "eu-west-1"
+      - id: volume
+        desc: /etc/appconf/nginx.conf exists inside the container
+        points: 30
+        hint: "volumes: [{name: files, configMap: {name: app-files}}]"
+        run: |
+          kubectl -n conf exec configured -- cat /etc/appconf/nginx.conf 2>/dev/null | grep -q 'listen 8080'
+    hints:
+      - title: Creating the ConfigMaps
+        cost: 6
+        text: |
+          ```
+          kubectl -n conf create configmap app-settings \
+            --from-literal=LOG_LEVEL=debug --from-literal=REGION=eu-west-1
+
+          kubectl -n conf create configmap app-files \
+            --from-literal=nginx.conf='server { listen 8080; }'
+          ```
+      - title: All three wirings in one container
+        cost: 10
+        text: |
+          ```yaml
+          containers:
+            - name: c
+              image: busybox:1.36
+              command: ["sleep", "3600"]
+              env:
+                - name: LEVEL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: app-settings
+                      key: LOG_LEVEL
+              envFrom:
+                - configMapRef:
+                    name: app-settings
+              volumeMounts:
+                - name: files
+                  mountPath: /etc/appconf
+          ```
+      - title: Which one updates live
+        cost: 8
+        text: |
+          Only the volume. Change the ConfigMap and the mounted file updates
+          within a minute or so. Env vars are fixed at container start - you
+          have to restart the pod to pick up a change.
+    solution: |
+      ```bash
+      kubectl -n conf create configmap app-settings \
+        --from-literal=LOG_LEVEL=debug --from-literal=REGION=eu-west-1
+      kubectl -n conf create configmap app-files \
+        --from-literal=nginx.conf='server { listen 8080; }'
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: configured, namespace: conf}
+      spec:
+        volumes:
+          - name: files
+            configMap: {name: app-files}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            env:
+              - name: LEVEL
+                valueFrom:
+                  configMapKeyRef: {name: app-settings, key: LOG_LEVEL}
+            envFrom:
+              - configMapRef: {name: app-settings}
+            volumeMounts:
+              - {name: files, mountPath: /etc/appconf}
+      YAML
+      ```
+    solve_script: |
+      kubectl -n conf create configmap app-settings --from-literal=LOG_LEVEL=debug --from-literal=REGION=eu-west-1
+      kubectl -n conf create configmap app-files --from-literal=nginx.conf='server { listen 8080; }'
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: configured, namespace: conf}
+      spec:
+        volumes:
+          - name: files
+            configMap: {name: app-files}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            env:
+              - name: LEVEL
+                valueFrom:
+                  configMapKeyRef: {name: app-settings, key: LOG_LEVEL}
+            envFrom:
+              - configMapRef: {name: app-settings}
+            volumeMounts: [{name: files, mountPath: /etc/appconf}]
+      YAML
+      kubectl -n conf wait --for=condition=Ready pod/configured --timeout=180s
+
+  - id: cfg-secrets
+    title: Secrets - generic, TLS and image pull
+    difficulty: medium
+    exams: [CKA, CKAD, KCSA]
+    concepts: [secrets, base64, tls secrets, imagePullSecrets, serviceaccounts]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: Three Secret types, plus the truth about base64 not being encryption.
+    scenario: |
+      Secrets look like ConfigMaps but carry different metadata and, in a
+      properly configured cluster, get encrypted at rest. They are **not**
+      encrypted by default, and base64 is encoding, not encryption - anyone
+      with `get secrets` can read them.
+
+      Create the three types you meet most often, and mount one so the
+      values land as files rather than env vars (files are less likely to
+      leak into logs or `/proc/<pid>/environ`).
+    docs:
+      - https://kubernetes.io/docs/concepts/configuration/secret/
+      - https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
+    tasks:
+      - text: "In namespace `vaultns`, create a generic Secret `db-creds` with `username=admin` and `password=s3cr3t`."
+      - text: "Create a TLS Secret `web-tls` from a self-signed certificate and key (generate them with openssl)."
+      - text: "Create a docker-registry Secret `regcred` for server `registry.example.com`, user `bot`, password `token123`, email `bot@example.com`."
+      - text: "Create a Pod `consumer` (`busybox:1.36`, `sleep 3600`) that mounts `db-creds` at `/secrets` and references `regcred` as an imagePullSecret."
+    setup:
+      - kind: shell
+        desc: create the vaultns namespace
+        run: kubectl create ns vaultns
+    verify:
+      - id: generic
+        desc: Secret vaultns/db-creds holds the right username and password
+        points: 25
+        hint: "kubectl -n vaultns create secret generic db-creds --from-literal=username=admin --from-literal=password=s3cr3t"
+        run: |
+          eq "$(jp secret db-creds '{.data.username}' -n vaultns | base64 -d 2>/dev/null)" "admin" || exit 1
+          eq "$(jp secret db-creds '{.data.password}' -n vaultns | base64 -d 2>/dev/null)" "s3cr3t"
+      - id: tls
+        desc: Secret vaultns/web-tls is of type kubernetes.io/tls with both keys
+        points: 25
+        hint: "kubectl -n vaultns create secret tls web-tls --cert=tls.crt --key=tls.key"
+        run: |
+          eq "$(jp secret web-tls '{.type}' -n vaultns)" "kubernetes.io/tls" || exit 1
+          jp secret web-tls '{.data.tls\.crt}' -n vaultns | grep -q . || exit 1
+          jp secret web-tls '{.data.tls\.key}' -n vaultns | grep -q .
+      - id: regcred
+        desc: Secret vaultns/regcred is a dockerconfigjson for registry.example.com
+        points: 25
+        hint: "kubectl -n vaultns create secret docker-registry regcred --docker-server=... --docker-username=... --docker-password=..."
+        run: |
+          eq "$(jp secret regcred '{.type}' -n vaultns)" "kubernetes.io/dockerconfigjson" || exit 1
+          jp secret regcred '{.data.\.dockerconfigjson}' -n vaultns | base64 -d 2>/dev/null | grep -q 'registry.example.com'
+      - id: consumer
+        desc: The pod mounts db-creds at /secrets and uses regcred to pull
+        points: 25
+        hint: "volumes: [{name: s, secret: {secretName: db-creds}}] and spec.imagePullSecrets"
+        run: |
+          eq "$(jp pod consumer '{.spec.imagePullSecrets[0].name}' -n vaultns)" "regcred" || exit 1
+          retry bash -c 'kubectl -n vaultns get pod consumer -o jsonpath="{.status.phase}" | grep -q Running'
+          kubectl -n vaultns exec consumer -- cat /secrets/password 2>/dev/null | grep -q 's3cr3t'
+    hints:
+      - title: Generating a self-signed cert
+        cost: 8
+        text: |
+          ```
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout tls.key -out tls.crt -subj "/CN=web.example.com"
+          kubectl -n vaultns create secret tls web-tls --cert=tls.crt --key=tls.key
+          ```
+      - title: The docker-registry form
+        cost: 8
+        text: |
+          ```
+          kubectl -n vaultns create secret docker-registry regcred \
+            --docker-server=registry.example.com \
+            --docker-username=bot \
+            --docker-password=token123 \
+            --docker-email=bot@example.com
+          ```
+      - title: Mounting a Secret
+        cost: 10
+        text: |
+          Each key becomes a file named after the key:
+
+          ```yaml
+          spec:
+            imagePullSecrets:
+              - name: regcred
+            volumes:
+              - name: creds
+                secret:
+                  secretName: db-creds
+            containers:
+              - name: c
+                volumeMounts:
+                  - name: creds
+                    mountPath: /secrets
+                    readOnly: true
+          ```
+          So `/secrets/username` and `/secrets/password`.
+    solution: |
+      ```bash
+      kubectl -n vaultns create secret generic db-creds \
+        --from-literal=username=admin --from-literal=password=s3cr3t
+
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout tls.key -out tls.crt -subj "/CN=web.example.com"
+      kubectl -n vaultns create secret tls web-tls --cert=tls.crt --key=tls.key
+
+      kubectl -n vaultns create secret docker-registry regcred \
+        --docker-server=registry.example.com --docker-username=bot \
+        --docker-password=token123 --docker-email=bot@example.com
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: consumer, namespace: vaultns}
+      spec:
+        imagePullSecrets:
+          - name: regcred
+        volumes:
+          - name: creds
+            secret: {secretName: db-creds}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts:
+              - {name: creds, mountPath: /secrets, readOnly: true}
+      YAML
+      ```
+    solve_script: |
+      kubectl -n vaultns create secret generic db-creds --from-literal=username=admin --from-literal=password=s3cr3t
+      cd "$(mktemp -d)"
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout tls.key -out tls.crt -subj "/CN=web.example.com" 2>/dev/null
+      kubectl -n vaultns create secret tls web-tls --cert=tls.crt --key=tls.key
+      kubectl -n vaultns create secret docker-registry regcred \
+        --docker-server=registry.example.com --docker-username=bot \
+        --docker-password=token123 --docker-email=bot@example.com
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: consumer, namespace: vaultns}
+      spec:
+        imagePullSecrets: [{name: regcred}]
+        volumes:
+          - name: creds
+            secret: {secretName: db-creds}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts: [{name: creds, mountPath: /secrets, readOnly: true}]
+      YAML
+      kubectl -n vaultns wait --for=condition=Ready pod/consumer --timeout=180s
+
+  - id: cfg-subpath-immutable
+    title: subPath mounts and immutable ConfigMaps
+    difficulty: medium
+    exams: [CKAD]
+    concepts: [subPath, configmaps, immutable, volume projection]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: Inject one file into a directory without wiping everything else in it.
+    scenario: |
+      Mounting a ConfigMap at `/etc/nginx` replaces the whole directory -
+      every other file in the image disappears and nginx will not start.
+      `subPath` mounts a single key as a single file and leaves the rest of
+      the directory alone. The price is that subPath mounts do not receive
+      live updates.
+
+      Separately, marking a ConfigMap `immutable: true` stops accidental
+      edits and lets the kubelet skip watching it, which matters at scale.
+    docs:
+      - https://kubernetes.io/docs/concepts/storage/volumes/#using-subpath
+      - https://kubernetes.io/docs/concepts/configuration/configmap/#configmap-immutable
+    tasks:
+      - text: "In namespace `sub`, create a ConfigMap `site` with key `index.html` = `<h1>klab</h1>`."
+      - text: "Mark `site` immutable."
+      - text: "Create a Deployment `web` (1 replica, `nginx:1.27-alpine`) that mounts only the `index.html` key over `/usr/share/nginx/html/index.html` using subPath."
+      - text: "The rest of `/usr/share/nginx/html` must still be intact (the default 50x.html must still exist)."
+      - text: "The Deployment must roll out and serve the custom page."
+    setup:
+      - kind: shell
+        desc: create the sub namespace
+        run: kubectl create ns sub
+    verify:
+      - id: immutable
+        desc: ConfigMap sub/site is immutable and has the right content
+        points: 25
+        hint: "immutable: true is a top-level field on the ConfigMap"
+        run: |
+          eq "$(jp cm site '{.immutable}' -n sub)" "true" || exit 1
+          jp cm site '{.data.index\.html}' -n sub | grep -q 'klab'
+      - id: subpath
+        desc: The volumeMount uses subPath index.html
+        points: 25
+        hint: "volumeMounts: [{name: site, mountPath: /usr/share/nginx/html/index.html, subPath: index.html}]"
+        run: |
+          eq "$(jp deploy web '{.spec.template.spec.containers[0].volumeMounts[0].subPath}' -n sub)" "index.html" || exit 1
+          jp deploy web '{.spec.template.spec.containers[0].volumeMounts[0].mountPath}' -n sub \
+            | grep -q '/usr/share/nginx/html/index.html'
+      - id: served
+        desc: The pod serves the custom index page
+        points: 30
+        hint: "kubectl -n sub exec deploy/web -- wget -qO- localhost"
+        run: |
+          rollout sub deploy/web 180s || exit 1
+          pod=$(kubectl -n sub get pods -l app=web -o name | head -1)
+          kubectl -n sub exec "$pod" -- cat /usr/share/nginx/html/index.html | grep -q 'klab'
+      - id: intact
+        desc: The rest of the html directory survived the mount
+        points: 20
+        hint: "if 50x.html is gone you mounted the whole directory, not one key"
+        run: |
+          pod=$(kubectl -n sub get pods -l app=web -o name | head -1)
+          kubectl -n sub exec "$pod" -- ls /usr/share/nginx/html/50x.html >/dev/null 2>&1
+    hints:
+      - title: Making it immutable
+        cost: 8
+        text: |
+          You cannot flip an existing ConfigMap to immutable and keep
+          editing it - immutability is one-way. Create it with the field, or
+          patch once:
+
+          ```
+          kubectl -n sub patch cm site -p '{"immutable":true}'
+          ```
+          After that, any edit is rejected; you must delete and recreate.
+      - title: The subPath mount
+        cost: 10
+        text: |
+          ```yaml
+          volumes:
+            - name: site
+              configMap:
+                name: site
+          containers:
+            - name: nginx
+              volumeMounts:
+                - name: site
+                  mountPath: /usr/share/nginx/html/index.html
+                  subPath: index.html
+          ```
+          Note the mountPath ends in the filename, and subPath names the key.
+      - title: Proving the directory survived
+        cost: 8
+        text: |
+          ```
+          kubectl -n sub exec deploy/web -- ls -la /usr/share/nginx/html
+          ```
+          Without subPath you would see only `index.html` - the image's
+          `50x.html` would be hidden by the mount.
+    solution: |
+      ```bash
+      kubectl -n sub create configmap site --from-literal=index.html='<h1>klab</h1>'
+      kubectl -n sub patch cm site -p '{"immutable":true}'
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: web, namespace: sub}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels: {app: web}
+        template:
+          metadata:
+            labels: {app: web}
+          spec:
+            volumes:
+              - name: site
+                configMap: {name: site}
+            containers:
+              - name: nginx
+                image: nginx:1.27-alpine
+                volumeMounts:
+                  - name: site
+                    mountPath: /usr/share/nginx/html/index.html
+                    subPath: index.html
+      YAML
+      ```
+    solve_script: |
+      kubectl -n sub create configmap site --from-literal=index.html='<h1>klab</h1>'
+      kubectl -n sub patch cm site -p '{"immutable":true}'
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: web, namespace: sub}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels: {app: web}
+        template:
+          metadata:
+            labels: {app: web}
+          spec:
+            volumes:
+              - name: site
+                configMap: {name: site}
+            containers:
+              - name: nginx
+                image: nginx:1.27-alpine
+                volumeMounts:
+                  - name: site
+                    mountPath: /usr/share/nginx/html/index.html
+                    subPath: index.html
+      YAML
+      kubectl -n sub rollout status deploy/web --timeout=240s
+
+  - id: cfg-resourcequota
+    title: ResourceQuota - cap what a namespace may consume
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [resourcequota, multi-tenancy, requests, limits, object counts]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Hard limits per namespace, and the error you get when you hit one.
+    scenario: |
+      A team keeps filling the cluster. Give their namespace a hard budget
+      for compute and a cap on object counts.
+
+      The consequence people forget: once a ResourceQuota constrains
+      `requests.cpu` or `limits.memory`, **every** pod created in that
+      namespace must specify those values, or the API server rejects it
+      outright. That is the single most common "my deployment stopped
+      working after we added quotas" incident.
+    docs:
+      - https://kubernetes.io/docs/concepts/policy/resource-quotas/
+    tasks:
+      - text: "Create a ResourceQuota `team-quota` in `tenant` limiting: `requests.cpu` 1, `requests.memory` 1Gi, `limits.cpu` 2, `limits.memory` 2Gi."
+      - text: "The same quota must cap `pods` at 5 and `services` at 3."
+      - text: "Deploy a Deployment `sized` (2 replicas, `registry.k8s.io/pause:3.9`) that fits inside the quota, with explicit requests and limits."
+      - text: "Prove you understand the failure mode: record in ConfigMap `quotaanswers` in `tenant`, key `rejected_by`, the value `ResourceQuota`."
+    setup:
+      - kind: shell
+        desc: create the tenant namespace
+        run: kubectl create ns tenant
+    verify:
+      - id: quota
+        desc: The quota sets all four compute limits
+        points: 30
+        hint: "kubectl -n tenant create quota team-quota --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=5,services=3"
+        run: |
+          eq "$(jp quota team-quota '{.spec.hard.requests\.cpu}' -n tenant)" "1" || exit 1
+          eq "$(jp quota team-quota '{.spec.hard.requests\.memory}' -n tenant)" "1Gi" || exit 1
+          eq "$(jp quota team-quota '{.spec.hard.limits\.cpu}' -n tenant)" "2" || exit 1
+          eq "$(jp quota team-quota '{.spec.hard.limits\.memory}' -n tenant)" "2Gi"
+      - id: counts
+        desc: The quota caps pods at 5 and services at 3
+        points: 20
+        hint: "object count quotas use the plural resource name as the key"
+        run: |
+          eq "$(jp quota team-quota '{.spec.hard.pods}' -n tenant)" "5" || exit 1
+          eq "$(jp quota team-quota '{.spec.hard.services}' -n tenant)" "3"
+      - id: deployed
+        desc: The sized Deployment runs 2 replicas inside the quota
+        points: 30
+        hint: "with a quota in force, every container needs requests AND limits"
+        run: |
+          rollout tenant deploy/sized 180s || exit 1
+          eq "$(jp deploy sized '{.status.readyReplicas}' -n tenant)" "2" || exit 1
+          jp deploy sized '{.spec.template.spec.containers[0].resources.requests.cpu}' -n tenant | grep -q . || exit 1
+          jp deploy sized '{.spec.template.spec.containers[0].resources.limits.memory}' -n tenant | grep -q .
+      - id: used
+        desc: The quota is reporting real usage
+        points: 10
+        hint: "kubectl -n tenant describe quota team-quota"
+        run: |
+          jp quota team-quota '{.status.used.pods}' -n tenant | grep -Eq '^[1-9]'
+      - id: answer
+        desc: You recorded what rejects an unsized pod
+        points: 10
+        hint: "the admission plugin that denies it is called ResourceQuota"
+        run: |
+          eq "$(jp cm quotaanswers '{.data.rejected_by}' -n tenant | tr -d ' ')" "ResourceQuota"
+    hints:
+      - title: Creating the quota
+        cost: 8
+        text: |
+          ```
+          kubectl -n tenant create quota team-quota \
+            --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=5,services=3
+          ```
+      - title: Sizing the Deployment
+        cost: 10
+        text: |
+          Two replicas must fit inside 1 CPU / 1Gi of requests:
+
+          ```
+          kubectl -n tenant create deployment sized \
+            --image=registry.k8s.io/pause:3.9 --replicas=2
+          kubectl -n tenant set resources deploy/sized \
+            --requests=cpu=100m,memory=64Mi --limits=cpu=200m,memory=128Mi
+          ```
+      - title: Seeing the rejection for yourself
+        cost: 8
+        text: |
+          ```
+          kubectl -n tenant run nope --image=registry.k8s.io/pause:3.9
+          ```
+          fails with `must specify limits.cpu ... requests.cpu ...`, and the
+          error names `ResourceQuota` as the admission plugin. A LimitRange
+          with defaults is how you make unsized pods work again.
+    solution: |
+      ```bash
+      kubectl -n tenant create quota team-quota \
+        --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=5,services=3
+
+      kubectl -n tenant create deployment sized --image=registry.k8s.io/pause:3.9 --replicas=2
+      kubectl -n tenant set resources deploy/sized \
+        --requests=cpu=100m,memory=64Mi --limits=cpu=200m,memory=128Mi
+      kubectl -n tenant rollout status deploy/sized
+
+      kubectl -n tenant create configmap quotaanswers --from-literal=rejected_by=ResourceQuota
+      ```
+    solve_script: |
+      kubectl -n tenant create quota team-quota \
+        --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=5,services=3
+      kubectl -n tenant create deployment sized --image=registry.k8s.io/pause:3.9 --replicas=2
+      kubectl -n tenant set resources deploy/sized --requests=cpu=100m,memory=64Mi --limits=cpu=200m,memory=128Mi
+      kubectl -n tenant rollout status deploy/sized --timeout=240s
+      kubectl -n tenant create configmap quotaanswers --from-literal=rejected_by=ResourceQuota
+
+  - id: cfg-limitrange
+    title: LimitRange - defaults and guardrails for pods that forget
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [limitrange, defaults, min, max, admission]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: Give every container sane resources automatically, and reject silly ones.
+    scenario: |
+      A LimitRange is applied by admission control at pod creation. It can:
+
+      - inject `default` limits and `defaultRequest` requests into
+        containers that specify none
+      - enforce a `min` and `max` so nobody asks for 64 CPUs
+
+      Combined with a ResourceQuota, it is what makes a shared cluster
+      workable: the quota caps the namespace, the LimitRange makes sure
+      individual pods are reasonable and never unsized.
+    docs:
+      - https://kubernetes.io/docs/concepts/policy/limit-range/
+    tasks:
+      - text: "Create a LimitRange `defaults` in `guard` for type Container: default limits cpu 200m / memory 256Mi, defaultRequest cpu 100m / memory 128Mi."
+      - text: "Also set min cpu 50m / memory 64Mi and max cpu 1 / memory 1Gi."
+      - text: "Create a Pod `unsized` in `guard` (`registry.k8s.io/pause:3.9`) with **no** resources block, and confirm it comes out with the defaults applied."
+    setup:
+      - kind: shell
+        desc: create the guard namespace
+        run: kubectl create ns guard
+    verify:
+      - id: limitrange
+        desc: LimitRange guard/defaults sets default and defaultRequest
+        points: 30
+        hint: "spec.limits is a list; type: Container"
+        run: |
+          eq "$(jp limitrange defaults '{.spec.limits[0].type}' -n guard)" "Container" || exit 1
+          eq "$(jp limitrange defaults '{.spec.limits[0].default.cpu}' -n guard)" "200m" || exit 1
+          eq "$(jp limitrange defaults '{.spec.limits[0].default.memory}' -n guard)" "256Mi" || exit 1
+          eq "$(jp limitrange defaults '{.spec.limits[0].defaultRequest.cpu}' -n guard)" "100m" || exit 1
+          eq "$(jp limitrange defaults '{.spec.limits[0].defaultRequest.memory}' -n guard)" "128Mi"
+      - id: bounds
+        desc: min and max are set
+        points: 25
+        hint: "min and max are siblings of default and defaultRequest"
+        run: |
+          eq "$(jp limitrange defaults '{.spec.limits[0].min.cpu}' -n guard)" "50m" || exit 1
+          eq "$(jp limitrange defaults '{.spec.limits[0].max.cpu}' -n guard)" "1" || exit 1
+          eq "$(jp limitrange defaults '{.spec.limits[0].max.memory}' -n guard)" "1Gi"
+      - id: injected
+        desc: The unsized pod received the defaults automatically
+        points: 45
+        hint: "create the pod AFTER the LimitRange -- it is applied at admission time only"
+        run: |
+          eq "$(jp pod unsized '{.spec.containers[0].resources.limits.cpu}' -n guard)" "200m" || exit 1
+          eq "$(jp pod unsized '{.spec.containers[0].resources.requests.cpu}' -n guard)" "100m" || exit 1
+          eq "$(jp pod unsized '{.spec.containers[0].resources.limits.memory}' -n guard)" "256Mi"
+    hints:
+      - title: The manifest
+        cost: 10
+        text: |
+          ```yaml
+          apiVersion: v1
+          kind: LimitRange
+          metadata: {name: defaults, namespace: guard}
+          spec:
+            limits:
+              - type: Container
+                default:
+                  cpu: 200m
+                  memory: 256Mi
+                defaultRequest:
+                  cpu: 100m
+                  memory: 128Mi
+                min:
+                  cpu: 50m
+                  memory: 64Mi
+                max:
+                  cpu: "1"
+                  memory: 1Gi
+          ```
+      - title: Order matters
+        cost: 10
+        text: |
+          A LimitRange is only applied when a pod is admitted. Pods that
+          already exist are untouched. Create the LimitRange first, then the
+          pod - if you did it the other way round, delete and recreate the pod.
+      - title: Quote the bare numbers
+        cost: 8
+        text: |
+          `cpu: 1` is fine, but in YAML `max: {cpu: 1}` and `cpu: "1"` both
+          work. Memory values always need a unit suffix.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: LimitRange
+      metadata: {name: defaults, namespace: guard}
+      spec:
+        limits:
+          - type: Container
+            default: {cpu: 200m, memory: 256Mi}
+            defaultRequest: {cpu: 100m, memory: 128Mi}
+            min: {cpu: 50m, memory: 64Mi}
+            max: {cpu: "1", memory: 1Gi}
+      YAML
+
+      kubectl -n guard run unsized --image=registry.k8s.io/pause:3.9
+      kubectl -n guard get pod unsized -o jsonpath='{.spec.containers[0].resources}'
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: LimitRange
+      metadata: {name: defaults, namespace: guard}
+      spec:
+        limits:
+          - type: Container
+            default: {cpu: 200m, memory: 256Mi}
+            defaultRequest: {cpu: 100m, memory: 128Mi}
+            min: {cpu: 50m, memory: 64Mi}
+            max: {cpu: "1", memory: 1Gi}
+      YAML
+      sleep 3
+      kubectl -n guard run unsized --image=registry.k8s.io/pause:3.9
+      kubectl -n guard wait --for=condition=Ready pod/unsized --timeout=180s
+
+  - id: cfg-command-args
+    title: command, args and the env-var expansion trap
+    difficulty: medium
+    exams: [CKAD]
+    concepts: [command, args, entrypoint, env expansion]
+    par_minutes: 11
+    estimated_minutes: 14
+    blurb: Kubernetes command = Docker ENTRYPOINT, args = CMD. Getting this wrong crashes pods.
+    scenario: |
+      This mapping trips people up constantly:
+
+      | Kubernetes | Docker     |
+      |------------|------------|
+      | `command`  | ENTRYPOINT |
+      | `args`     | CMD        |
+
+      Setting `command` replaces the image's entrypoint entirely. And `$(VAR)`
+      expansion works inside command and args - but only for variables
+      declared earlier in the same `env` list, and only with the `$(...)`
+      syntax, not shell `${...}`.
+
+      Build a pod that gets all of this right.
+    docs:
+      - https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/
+      - https://kubernetes.io/docs/tasks/inject-data-application/define-interdependent-environment-variables/
+    tasks:
+      - text: "In namespace `cmd`, create a Pod `greeter` (`busybox:1.36`) with env vars `NAME=kubestronaut` and `GREETING=hello $(NAME)`."
+      - text: "Its command must be `sh -c` and its args must print `$GREETING` and then sleep 3600."
+      - text: "The pod must stay Running (not complete and not crash-loop)."
+      - text: "The logs must contain the fully expanded text `hello kubestronaut`."
+    setup:
+      - kind: shell
+        desc: create the cmd namespace
+        run: kubectl create ns cmd
+    verify:
+      - id: env
+        desc: GREETING is defined using $(NAME) expansion
+        points: 30
+        hint: "declare NAME before GREETING in the env list, and use $(NAME) not ${NAME}"
+        run: |
+          v=$(jp pod greeter '{.spec.containers[0].env[?(@.name=="GREETING")].value}' -n cmd)
+          echo "$v" | grep -q 'NAME' || exit 1
+          eq "$(jp pod greeter '{.spec.containers[0].env[?(@.name=="NAME")].value}' -n cmd)" "kubestronaut"
+      - id: command
+        desc: The container command is sh -c
+        points: 25
+        hint: 'command: ["sh", "-c"]'
+        run: |
+          jp pod greeter '{.spec.containers[0].command[*]}' -n cmd | grep -q 'sh' || exit 1
+          jp pod greeter '{.spec.containers[0].command[*]}' -n cmd | grep -q '\-c'
+      - id: running
+        desc: The pod is Running, not Completed or CrashLooping
+        points: 20
+        hint: "the container must not exit -- keep it alive with sleep"
+        run: |
+          RETRY=25 retry bash -c '[ "$(kubectl -n cmd get pod greeter -o jsonpath="{.status.phase}")" = "Running" ]'
+      - id: expanded
+        desc: The logs show the expanded greeting
+        points: 25
+        hint: "kubectl -n cmd logs greeter"
+        run: |
+          RETRY=20 retry bash -c 'kubectl -n cmd logs greeter 2>/dev/null | grep -q "hello kubestronaut"'
+    hints:
+      - title: Declaration order matters
+        cost: 8
+        text: |
+          `$(NAME)` only resolves if `NAME` appears **earlier** in the same
+          `env` list. Put it first:
+
+          ```yaml
+          env:
+            - name: NAME
+              value: kubestronaut
+            - name: GREETING
+              value: "hello $(NAME)"
+          ```
+      - title: command versus args
+        cost: 10
+        text: |
+          ```yaml
+          command: ["sh", "-c"]
+          args: ["echo $GREETING; sleep 3600"]
+          ```
+          Inside the shell you use `$GREETING` because the shell expands it.
+          In the `env` value you use `$(NAME)` because Kubernetes expands
+          that one.
+      - title: Why it exits immediately
+        cost: 8
+        text: |
+          If the args are only `echo $GREETING`, the container prints and
+          exits 0, the pod goes `Completed`, and with the default
+          `restartPolicy: Always` it restarts forever. Append `; sleep 3600`.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: greeter, namespace: cmd}
+      spec:
+        containers:
+          - name: c
+            image: busybox:1.36
+            env:
+              - name: NAME
+                value: kubestronaut
+              - name: GREETING
+                value: "hello $(NAME)"
+            command: ["sh", "-c"]
+            args: ["echo $GREETING; sleep 3600"]
+      YAML
+
+      kubectl -n cmd logs greeter     # hello kubestronaut
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: greeter, namespace: cmd}
+      spec:
+        containers:
+          - name: c
+            image: busybox:1.36
+            env:
+              - name: NAME
+                value: kubestronaut
+              - name: GREETING
+                value: "hello $(NAME)"
+            command: ["sh", "-c"]
+            args: ["echo $GREETING; sleep 3600"]
+      YAML
+      kubectl -n cmd wait --for=condition=Ready pod/greeter --timeout=180s

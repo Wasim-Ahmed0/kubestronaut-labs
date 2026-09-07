@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# klab -- Kubestronaut lab platform launcher (macOS + Linux)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PY=""
+for c in python3 python3.13 python3.12 python3.11 python3.10 python3.9 python; do
+  if command -v "$c" >/dev/null 2>&1; then
+    if "$c" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,8) else 1)' 2>/dev/null; then
+      PY="$c"; break
+    fi
+  fi
+done
+if [ -z "$PY" ]; then
+  echo "klab needs Python 3.8 or newer on your PATH." >&2
+  echo "  macOS:  brew install python3     Linux:  sudo apt install python3" >&2
+  exit 1
+fi
+
+# The lab shell puts a recording shim at the front of PATH; remember the real one.
+export KLAB_REAL_PATH="${KLAB_REAL_PATH:-$PATH}"
+
+case "${1:-run}" in
+  ""|run|start)   shift || true; exec "$PY" "$ROOT/engine/labctl.py" run "$@" ;;
+  doctor)         shift; exec "$PY" "$ROOT/engine/labctl.py" doctor "$@" ;;
+  cleanup|clean)  shift; exec "$PY" "$ROOT/engine/labctl.py" cleanup "$@" ;;
+  validate|test)  shift; exec "$PY" "$ROOT/engine/labctl.py" validate "$@" ;;
+  selftest)       shift; exec "$PY" "$ROOT/engine/selftest.py" "$@" ;;
+  labs|list)      shift; exec "$PY" "$ROOT/engine/validate.py" --list "$@" ;;
+  -h|--help|help)
+    cat <<'USAGE'
+klab -- practice labs for KCNA, KCSA, CKA, CKAD and CKS
+
+START
+  ./klab                    start the dashboard and wait for you to pick a lab
+  ./klab --remote           serve the dashboard on your LAN (headless servers)
+  ./klab --no-browser       do not try to open a browser
+  ./klab --port 8080        use a different port (default 9000)
+  ./klab --host ADDR        bind a specific address
+  ./klab --no-install       never auto-download kind or helm
+
+CHECK
+  ./klab doctor             check docker / kubectl / kind and the catalogue
+  ./klab selftest           run one lab end to end to prove the install works
+
+CATALOGUE
+  ./klab labs               list every lab (alias: list)
+  ./klab validate           static + shell-syntax checks on all labs (alias: test)
+  ./klab validate --only X  limit to labs matching an id, title or category
+  ./klab validate --live --solve
+                            build real clusters and prove every lab is solvable
+
+MAINTENANCE
+  ./klab cleanup            delete the practice cluster; progress is kept (alias: clean)
+
+INSIDE A LAB SHELL
+  verify    run the checks and see what still fails      (alias: check)
+  tasks     reprint the scenario and task list           (alias: brief)
+  hint      list hints;  hint 1  reveals one             (costs points)
+  progress  timer, checks passed, hints used, workdir
+  submit    verify, then finish and be graded            (alias: finish)
+  giveup    stop here and save a partial attempt
+  answer    show the reference solution                  (marks it assisted)
+  knode     list nodes;  knode NAME  shells into one
+  helpme    print this list again
+
+  k = kubectl · kn NS = switch namespace
+  $do = --dry-run=client -o yaml · $now = --grace-period=0 --force
+
+Progress lives in ~/.kubestronaut/state.json and survives everything else.
+USAGE
+    ;;
+  *) exec "$PY" "$ROOT/engine/labctl.py" run "$@" ;;
+esac

@@ -1,0 +1,640 @@
+category: Cloud Native Foundations
+labs:
+
+  - id: cn-containers-and-runtimes
+    title: Containers, images and the runtime underneath Kubernetes
+    difficulty: intro
+    exams: [KCNA]
+    concepts: [containers, container runtime, cri, containerd, images, namespaces, cgroups]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: What a container actually is, and which component on the node runs it.
+    scenario: |
+      Kubernetes does not run containers itself. The kubelet asks a
+      **container runtime** over the **Container Runtime Interface (CRI)**,
+      and the runtime uses Linux kernel features to do the work:
+
+      - **namespaces** isolate what a process can *see* (PIDs, network,
+        mounts, users)
+      - **cgroups** limit what it can *use* (CPU, memory, IO)
+      - a **union filesystem** stacks the read-only image layers with one
+        writable layer on top
+
+      A container is therefore not a small virtual machine. It is an
+      ordinary Linux process with a restricted view and a resource budget,
+      sharing the host kernel. That single sentence explains most of
+      Kubernetes security.
+
+      Find the real answers on this cluster and record them.
+    docs:
+      - https://kubernetes.io/docs/concepts/architecture/cri/
+      - https://kubernetes.io/docs/setup/production-environment/container-runtimes/
+    tasks:
+      - text: "Create namespace `klab` if it does not exist."
+      - text: "Record in ConfigMap `runtimeinfo` in `klab`: key `runtime` = the container runtime this cluster's nodes use (just the name, e.g. `containerd`)."
+      - text: "Key `interface` = the three-letter acronym for the API the kubelet uses to talk to it."
+      - text: "Key `isolation` = the kernel feature that isolates what a container can see."
+      - text: "Key `limits` = the kernel feature that limits what a container can use."
+      - text: "Key `shared` = what every container on a node shares with the host (one word)."
+    setup:
+      - kind: shell
+        desc: create the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: runtime
+        desc: The recorded runtime matches what the nodes actually report
+        points: 30
+        hint: "kubectl get nodes -o wide -- the CONTAINER-RUNTIME column"
+        run: |
+          want=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' \
+                 | cut -d: -f1)
+          got=$(jp cm runtimeinfo '{.data.runtime}' -n klab | tr -d ' ' | tr 'A-Z' 'a-z')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: interface
+        desc: The runtime interface acronym is recorded
+        points: 20
+        hint: "Container Runtime Interface"
+        run: |
+          eq "$(jp cm runtimeinfo '{.data.interface}' -n klab | tr -d ' ' | tr 'a-z' 'A-Z')" "CRI"
+      - id: isolation
+        desc: The isolation primitive is recorded
+        points: 20
+        hint: "PID, network, mount and user ... what?"
+        run: |
+          jp cm runtimeinfo '{.data.isolation}' -n klab | tr 'A-Z' 'a-z' | grep -q 'namespace'
+      - id: limits
+        desc: The resource-limiting primitive is recorded
+        points: 20
+        hint: "control groups, usually written as one word"
+        run: |
+          jp cm runtimeinfo '{.data.limits}' -n klab | tr 'A-Z' 'a-z' | tr -d ' ' \
+            | grep -Eq 'cgroups?|controlgroups?'
+      - id: shared
+        desc: What containers share with the host is recorded
+        points: 10
+        hint: "this is the difference between a container and a virtual machine"
+        run: |
+          jp cm runtimeinfo '{.data.shared}' -n klab | tr 'A-Z' 'a-z' | grep -q 'kernel'
+    hints:
+      - title: Asking the cluster
+        cost: 8
+        text: |
+          ```
+          kubectl get nodes -o wide
+          kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}'
+          ```
+          You will see something like `containerd://2.0.0`. The part before
+          the `://` is the runtime name.
+      - title: Seeing CRI directly
+        cost: 10
+        text: |
+          `crictl` is the CRI-level equivalent of `docker ps`, and it is what
+          you use when the API server is down:
+
+          ```
+          knode kubestronaut-control-plane crictl ps | head
+          knode kubestronaut-control-plane crictl images | head
+          ```
+      - title: The concepts in one line each
+        cost: 10
+        text: |
+          - **CRI** - the gRPC API between kubelet and runtime, so
+            Kubernetes does not care whether you run containerd or CRI-O
+          - **namespaces** - isolation of the view (what a process can see)
+          - **cgroups** - isolation of consumption (what it can use)
+          - **kernel** - shared with the host; a kernel exploit escapes the
+            container, which is why seccomp and dropped capabilities matter
+    solution: |
+      ```bash
+      kubectl create ns klab 2>/dev/null
+      RUNTIME=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' | cut -d: -f1)
+
+      kubectl -n klab create configmap runtimeinfo \
+        --from-literal=runtime=$RUNTIME \
+        --from-literal=interface=CRI \
+        --from-literal=isolation=namespaces \
+        --from-literal=limits=cgroups \
+        --from-literal=shared=kernel
+      ```
+    solve_script: |
+      kubectl create ns klab 2>/dev/null || true
+      RUNTIME=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}' | cut -d: -f1)
+      kubectl -n klab create configmap runtimeinfo \
+        --from-literal=runtime=$RUNTIME \
+        --from-literal=interface=CRI \
+        --from-literal=isolation=namespaces \
+        --from-literal=limits=cgroups \
+        --from-literal=shared=kernel
+
+  - id: cn-control-plane-roles
+    title: Who does what in the control plane
+    difficulty: easy
+    exams: [KCNA, CKA]
+    concepts: [api server, scheduler, controller manager, etcd, kubelet, kube-proxy]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: Trace a single pod creation through every component that touches it.
+    scenario: |
+      When you type `kubectl run web --image=nginx`, six components act in
+      sequence. Being able to narrate that sequence is worth a lot: it is a
+      guaranteed KCNA question, and it is how you decide where to look when
+      something breaks.
+
+      1. **kube-apiserver** authenticates you, validates the object, and
+         writes it to etcd. It is the *only* component that talks to etcd.
+      2. **etcd** stores it. It is the sole source of truth.
+      3. **kube-scheduler** notices a pod with no `nodeName`, picks a node,
+         and writes that choice back through the API server.
+      4. **kubelet** on that node sees a pod assigned to it and asks the
+         container runtime to start it.
+      5. **kube-controller-manager** runs the loops behind Deployments,
+         ReplicaSets, node lifecycle, and so on.
+      6. **kube-proxy** programs the node so Service IPs route to pods.
+
+      Match each responsibility to its component.
+    docs:
+      - https://kubernetes.io/docs/concepts/overview/components/
+    tasks:
+      - text: "Create namespace `klab` if needed, then create ConfigMap `cpanswers` in it."
+      - text: "Key `stores_state` = the component that is the source of truth for cluster state."
+      - text: "Key `only_talks_to_etcd` = the only component that reads and writes etcd directly."
+      - text: "Key `assigns_nodes` = the component that decides which node a pod runs on."
+      - text: "Key `starts_containers` = the component on each node that actually starts containers."
+      - text: "Key `service_routing` = the component that programs Service networking on each node."
+      - text: "Key `runs_control_loops` = the component that hosts the Deployment and ReplicaSet controllers."
+    setup:
+      - kind: shell
+        desc: create the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: etcd
+        desc: The state store is identified
+        points: 15
+        hint: "kubectl -n kube-system get pods -- it is the one with a database name"
+        run: |
+          jp cm cpanswers '{.data.stores_state}' -n klab | tr 'A-Z' 'a-z' | grep -q 'etcd'
+      - id: apiserver
+        desc: The only component that talks to etcd is identified
+        points: 20
+        hint: "every other component goes through it too"
+        run: |
+          jp cm cpanswers '{.data.only_talks_to_etcd}' -n klab | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -q 'apiserver'
+      - id: scheduler
+        desc: The node-assignment component is identified
+        points: 20
+        hint: "it sets spec.nodeName and does nothing else"
+        run: |
+          jp cm cpanswers '{.data.assigns_nodes}' -n klab | tr 'A-Z' 'a-z' | grep -q 'scheduler'
+      - id: kubelet
+        desc: The container-starting component is identified
+        points: 20
+        hint: "it runs on every node, including the control plane"
+        run: |
+          jp cm cpanswers '{.data.starts_containers}' -n klab | tr 'A-Z' 'a-z' | grep -q 'kubelet'
+      - id: proxy
+        desc: The Service networking component is identified
+        points: 15
+        hint: "kubectl -n kube-system get daemonsets"
+        run: |
+          jp cm cpanswers '{.data.service_routing}' -n klab | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -q 'kubeproxy'
+      - id: controllers
+        desc: The controller host is identified
+        points: 10
+        hint: "one binary containing dozens of control loops"
+        run: |
+          jp cm cpanswers '{.data.runs_control_loops}' -n klab | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -q 'controllermanager'
+    hints:
+      - title: See them all running
+        cost: 8
+        text: |
+          ```
+          kubectl -n kube-system get pods
+          kubectl -n kube-system get daemonsets
+          ```
+          On a kubeadm cluster you will see `etcd-*`, `kube-apiserver-*`,
+          `kube-controller-manager-*` and `kube-scheduler-*` as static pods
+          on the control plane, plus `kube-proxy` as a DaemonSet on every
+          node. The kubelet is not a pod at all - it is a systemd service.
+      - title: Watch the scheduler work
+        cost: 10
+        text: |
+          ```
+          kubectl run trace --image=registry.k8s.io/pause:3.9 --dry-run=server -o yaml \
+            | grep nodeName          # nothing yet
+          kubectl run trace --image=registry.k8s.io/pause:3.9
+          kubectl get pod trace -o jsonpath='{.spec.nodeName}'   # the scheduler filled it in
+          kubectl get events --field-selector involvedObject.name=trace
+          ```
+          The `Scheduled` event names the scheduler explicitly.
+      - title: The exam-answer versions
+        cost: 10
+        text: |
+          - etcd - state
+          - kube-apiserver - the front door; the only etcd client
+          - kube-scheduler - placement decisions only
+          - kubelet - node agent; talks to the runtime
+          - kube-proxy - Service routing rules on each node
+          - kube-controller-manager - the reconciliation loops
+    solution: |
+      ```bash
+      kubectl create ns klab 2>/dev/null
+      kubectl -n klab create configmap cpanswers \
+        --from-literal=stores_state=etcd \
+        --from-literal=only_talks_to_etcd=kube-apiserver \
+        --from-literal=assigns_nodes=kube-scheduler \
+        --from-literal=starts_containers=kubelet \
+        --from-literal=service_routing=kube-proxy \
+        --from-literal=runs_control_loops=kube-controller-manager
+      ```
+    solve_script: |
+      kubectl create ns klab 2>/dev/null || true
+      kubectl -n klab create configmap cpanswers \
+        --from-literal=stores_state=etcd \
+        --from-literal=only_talks_to_etcd=kube-apiserver \
+        --from-literal=assigns_nodes=kube-scheduler \
+        --from-literal=starts_containers=kubelet \
+        --from-literal=service_routing=kube-proxy \
+        --from-literal=runs_control_loops=kube-controller-manager
+
+  - id: cn-declarative-model
+    title: Declarative versus imperative, and the reconciliation loop
+    difficulty: easy
+    exams: [KCNA, CKAD]
+    concepts: [declarative, desired state, reconciliation, controllers, gitops]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Prove to yourself that Kubernetes fights back when reality drifts.
+    scenario: |
+      The idea underneath everything: you declare a desired state, and
+      controllers work continuously to make the world match. You do not
+      execute a deployment - you state a wish and something else keeps it
+      true.
+
+      That is why `kubectl delete pod` on a Deployment's pod appears to do
+      nothing, why editing a ReplicaSet a Deployment owns gets reverted, and
+      why GitOps works at all - if the cluster converges on a declared
+      state, that declaration may as well live in git.
+
+      Demonstrate drift correction three times over.
+    docs:
+      - https://kubernetes.io/docs/concepts/overview/working-with-objects/
+      - https://kubernetes.io/docs/concepts/architecture/controller/
+    tasks:
+      - text: "In namespace `declare`, Deployment `web` wants 3 replicas. Delete one of its pods and confirm the count returns to 3."
+      - text: "Scale the underlying **ReplicaSet** directly to 1, and confirm the Deployment controller puts it back to 3."
+      - text: "Record in ConfigMap `declareinfo` in `declare`: key `pattern` = the name of the loop that reconciles desired and actual state (one word)."
+      - text: "Key `restored_by` = the component that hosts that loop."
+      - text: "Leave the Deployment healthy at 3 ready replicas."
+    setup:
+      - kind: shell
+        desc: deploy a three-replica web app
+        run: |
+          kubectl create ns declare
+          kubectl -n declare create deployment web --image=registry.k8s.io/pause:3.9 --replicas=3
+          kubectl -n declare rollout status deploy/web --timeout=240s
+    verify:
+      - id: still-three
+        desc: The Deployment is back at 3 ready replicas
+        points: 35
+        hint: "delete a pod and just watch -- you do not have to do anything to fix it"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n declare get deploy web -o jsonpath="{.status.readyReplicas}")" = "3" ]'
+      - id: rs-restored
+        desc: The ReplicaSet is back to 3 too, even if you scaled it down
+        points: 30
+        hint: "the Deployment controller owns the ReplicaSet and overrides you"
+        run: |
+          rs=$(kubectl -n declare get rs -o jsonpath='{.items[0].metadata.name}')
+          [ -n "$rs" ] || exit 1
+          RETRY=30 retry bash -c "[ \"\$(kubectl -n declare get rs $rs -o jsonpath='{.spec.replicas}')\" = '3' ]"
+      - id: pattern
+        desc: You named the reconciliation pattern
+        points: 20
+        hint: "controllers run a continuous ... loop"
+        run: |
+          jp cm declareinfo '{.data.pattern}' -n declare | tr 'A-Z' 'a-z' \
+            | grep -Eq 'reconcil|control loop|controlloop'
+      - id: component
+        desc: You named the component that hosts the Deployment controller
+        points: 15
+        hint: "one binary holds dozens of controllers"
+        run: |
+          jp cm declareinfo '{.data.restored_by}' -n declare | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -q 'controllermanager'
+    hints:
+      - title: Watch the self-healing
+        cost: 8
+        text: |
+          ```
+          kubectl -n declare get pods -w &
+          kubectl -n declare delete pod $(kubectl -n declare get pods -o name | head -1)
+          ```
+          A replacement appears immediately. The ReplicaSet controller saw
+          two pods where its spec said three and created one.
+      - title: Fighting the controller
+        cost: 10
+        text: |
+          ```
+          RS=$(kubectl -n declare get rs -o name | head -1)
+          kubectl -n declare scale $RS --replicas=1
+          kubectl -n declare get rs -w
+          ```
+          It bounces straight back to 3. The Deployment owns that ReplicaSet
+          and its own spec still says 3, so it corrects the drift. To
+          actually change it you change the Deployment.
+      - title: Imperative versus declarative in practice
+        cost: 10
+        text: |
+          - imperative: `kubectl run`, `kubectl scale`, `kubectl delete` -
+            fast, great in an exam, invisible afterwards
+          - declarative: `kubectl apply -f`, files in git - reviewable,
+            repeatable, and the basis of GitOps
+
+          Real teams use imperative commands to *generate* YAML, then commit
+          the YAML.
+    solution: |
+      ```bash
+      kubectl -n declare delete pod $(kubectl -n declare get pods -o name | head -1)
+      kubectl -n declare get pods                # back to 3 by itself
+
+      RS=$(kubectl -n declare get rs -o name | head -1)
+      kubectl -n declare scale $RS --replicas=1
+      sleep 3
+      kubectl -n declare get rs                  # back to 3
+
+      kubectl -n declare create configmap declareinfo \
+        --from-literal=pattern=reconciliation \
+        --from-literal=restored_by=kube-controller-manager
+      ```
+    solve_script: |
+      kubectl -n declare delete pod $(kubectl -n declare get pods -o name | head -1)
+      RS=$(kubectl -n declare get rs -o name | head -1)
+      kubectl -n declare scale $RS --replicas=1 || true
+      sleep 10
+      kubectl -n declare create configmap declareinfo \
+        --from-literal=pattern=reconciliation \
+        --from-literal=restored_by=kube-controller-manager
+      kubectl -n declare rollout status deploy/web --timeout=240s
+
+  - id: cn-ecosystem
+    title: The cloud native landscape - what solves what
+    difficulty: easy
+    exams: [KCNA, KCSA]
+    concepts: [cncf, service mesh, gitops, observability, serverless, autoscaling]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: Name the right tool category for each problem. Heavily tested on the KCNA.
+    scenario: |
+      The KCNA expects you to place the major project categories, not to
+      have operated all of them. The useful framing is problem-first:
+
+      - "I need mutual TLS, retries and traffic splitting between services,
+        without changing application code" -> a **service mesh**
+        (Istio, Linkerd)
+      - "The cluster should match what is in git, and drift should be
+        corrected automatically" -> **GitOps** (Argo CD, Flux)
+      - "I need metrics, and alerts based on them" -> **Prometheus**
+      - "I need to follow one request across ten services" -> **distributed
+        tracing** (Jaeger, OpenTelemetry)
+      - "I want to run a function and pay nothing when idle" ->
+        **serverless** (Knative)
+      - "Add nodes when pods will not fit" -> **Cluster Autoscaler**
+        (as opposed to the HPA, which adds pods)
+
+      Match each problem to its category.
+    docs:
+      - https://kubernetes.io/docs/concepts/overview/
+      - https://landscape.cncf.io/
+    tasks:
+      - text: "Create ConfigMap `landscape` in namespace `klab` with the following keys."
+      - text: "Key `mtls_between_services` = the category that gives you mTLS and traffic policy without code changes (two words)."
+      - text: "Key `cluster_matches_git` = the practice of driving cluster state from a git repository (one word)."
+      - text: "Key `metrics` = the CNCF project that is the de facto metrics and alerting standard."
+      - text: "Key `tracing` = the vendor-neutral project for traces and metrics instrumentation."
+      - text: "Key `scale_pods` = the Kubernetes object that adds more pods under load (three letters)."
+      - text: "Key `scale_nodes` = the component that adds more nodes when pods cannot be scheduled (two words)."
+    setup:
+      - kind: shell
+        desc: create the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: mesh
+        desc: Service mesh identified
+        points: 20
+        hint: "sidecar proxies handling traffic between services"
+        run: |
+          jp cm landscape '{.data.mtls_between_services}' -n klab | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -q 'servicemesh'
+      - id: gitops
+        desc: GitOps identified
+        points: 20
+        hint: "Argo CD and Flux are the two big implementations"
+        run: |
+          jp cm landscape '{.data.cluster_matches_git}' -n klab | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -q 'gitops'
+      - id: metrics
+        desc: Prometheus identified
+        points: 15
+        hint: "the second project ever to graduate from the CNCF"
+        run: |
+          jp cm landscape '{.data.metrics}' -n klab | tr 'A-Z' 'a-z' | grep -q 'prometheus'
+      - id: tracing
+        desc: A tracing project identified
+        points: 15
+        hint: "OpenTelemetry or Jaeger"
+        run: |
+          jp cm landscape '{.data.tracing}' -n klab | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -Eq 'opentelemetry|otel|jaeger'
+      - id: hpa
+        desc: The pod autoscaler identified
+        points: 15
+        hint: "HorizontalPodAutoscaler, abbreviated"
+        run: |
+          jp cm landscape '{.data.scale_pods}' -n klab | tr 'a-z' 'A-Z' | tr -d ' -' | grep -q 'HPA'
+      - id: ca
+        desc: The node autoscaler identified
+        points: 15
+        hint: "it talks to your cloud provider to add machines"
+        run: |
+          jp cm landscape '{.data.scale_nodes}' -n klab | tr 'A-Z' 'a-z' | tr -d ' -' \
+            | grep -Eq 'clusterautoscaler|karpenter'
+    hints:
+      - title: Pods versus nodes
+        cost: 8
+        text: |
+          This distinction is tested constantly:
+
+          - **HPA** - more *pods* of a workload, based on CPU or custom metrics
+          - **VPA** - bigger *pods* (adjusts requests and limits)
+          - **Cluster Autoscaler** - more *nodes*, triggered by pods that
+            cannot be scheduled anywhere
+      - title: Service mesh in one paragraph
+        cost: 10
+        text: |
+          A mesh injects a proxy sidecar next to every pod and routes all
+          traffic through it. That gives you mutual TLS, retries, timeouts,
+          circuit breaking, canary traffic splitting and per-call telemetry
+          without touching application code. The price is another control
+          plane and a proxy in every pod.
+      - title: GitOps in one paragraph
+        cost: 10
+        text: |
+          A controller in the cluster watches a git repository and applies
+          what it finds, continuously. Git becomes the audit log and the
+          rollback mechanism, and manual drift is reverted automatically.
+          It only works because Kubernetes is declarative.
+    solution: |
+      ```bash
+      kubectl create ns klab 2>/dev/null
+      kubectl -n klab create configmap landscape \
+        --from-literal=mtls_between_services="service mesh" \
+        --from-literal=cluster_matches_git=GitOps \
+        --from-literal=metrics=Prometheus \
+        --from-literal=tracing=OpenTelemetry \
+        --from-literal=scale_pods=HPA \
+        --from-literal=scale_nodes="Cluster Autoscaler"
+      ```
+    solve_script: |
+      kubectl create ns klab 2>/dev/null || true
+      kubectl -n klab create configmap landscape \
+        --from-literal=mtls_between_services="service mesh" \
+        --from-literal=cluster_matches_git=GitOps \
+        --from-literal=metrics=Prometheus \
+        --from-literal=tracing=OpenTelemetry \
+        --from-literal=scale_pods=HPA \
+        --from-literal=scale_nodes="Cluster Autoscaler"
+
+  - id: cn-security-model
+    title: The 4Cs and the Kubernetes threat model
+    difficulty: medium
+    exams: [KCSA, KCNA, CKS]
+    concepts: [4cs, threat model, defence in depth, authn, authz, admission]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: The framing the KCSA is built on, plus the request path every API call takes.
+    scenario: |
+      Two models to have straight in your head.
+
+      **The 4Cs of cloud native security**, outermost first: Cloud,
+      Cluster, Container, Code. Each layer can only be as secure as the one
+      outside it - hardening a container on a compromised node buys you
+      nothing.
+
+      **The API request path**: every call to the API server goes through
+      three gates in a fixed order:
+
+      1. **Authentication** - who are you? (certificates, tokens, OIDC)
+      2. **Authorization** - are you allowed? (RBAC, and Node/Webhook modes)
+      3. **Admission control** - should this specific object be allowed, and
+         should it be changed first? (mutating webhooks run before
+         validating ones)
+
+      A 401 is authentication. A 403 is authorization. A rejection naming a
+      policy is admission. Knowing which one you hit tells you where to fix it.
+    docs:
+      - https://kubernetes.io/docs/concepts/security/overview/
+      - https://kubernetes.io/docs/concepts/security/controlling-access/
+    tasks:
+      - text: "Create ConfigMap `secmodel` in namespace `klab`."
+      - text: "Key `layers` = the 4Cs in order from outermost to innermost, comma separated, lowercase (e.g. `a,b,c,d`)."
+      - text: "Key `stage1`, `stage2`, `stage3` = the three stages of the API request path, in order."
+      - text: "Key `code_401` = which stage returns a 401."
+      - text: "Key `code_403` = which stage returns a 403."
+      - text: "Key `mutating_first` = `true` or `false`, whether mutating admission webhooks run before validating ones."
+    setup:
+      - kind: shell
+        desc: create the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: layers
+        desc: The 4Cs are recorded in the right order
+        points: 25
+        hint: "outermost to innermost"
+        run: |
+          got=$(jp cm secmodel '{.data.layers}' -n klab | tr 'A-Z' 'a-z' | tr -d ' ')
+          eq "$got" "cloud,cluster,container,code"
+      - id: stages
+        desc: The three stages of the request path are in order
+        points: 30
+        hint: "authentication, then authorization, then admission"
+        run: |
+          s1=$(jp cm secmodel '{.data.stage1}' -n klab | tr 'A-Z' 'a-z' | tr -d ' ')
+          s2=$(jp cm secmodel '{.data.stage2}' -n klab | tr 'A-Z' 'a-z' | tr -d ' ')
+          s3=$(jp cm secmodel '{.data.stage3}' -n klab | tr 'A-Z' 'a-z' | tr -d ' ')
+          echo "$s1" | grep -q 'authentic' || exit 1
+          echo "$s2" | grep -q 'authoriz\|authoris' || exit 1
+          echo "$s3" | grep -q 'admission'
+      - id: codes
+        desc: The status codes map to the right stages
+        points: 25
+        hint: "401 means we do not know who you are; 403 means we know and you may not"
+        run: |
+          jp cm secmodel '{.data.code_401}' -n klab | tr 'A-Z' 'a-z' | grep -q 'authentic' || exit 1
+          jp cm secmodel '{.data.code_403}' -n klab | tr 'A-Z' 'a-z' | grep -q 'authoriz\|authoris'
+      - id: order
+        desc: Webhook ordering is recorded correctly
+        points: 20
+        hint: "a mutating webhook may change the object, so validation has to see the final version"
+        run: |
+          eq "$(jp cm secmodel '{.data.mutating_first}' -n klab | tr -d ' ' | tr 'A-Z' 'a-z')" "true"
+      - id: try-it
+        desc: You can demonstrate a 403 with an impersonated request
+        points: 0
+        hint: "kubectl auth can-i --as=system:serviceaccount:default:default list secrets -A"
+        run: |
+          kubectl auth can-i list secrets --as=system:serviceaccount:default:default -A 2>/dev/null \
+            | grep -qx no
+    hints:
+      - title: Seeing the three stages for real
+        cost: 10
+        text: |
+          ```
+          # authorization failure (403) - a known identity without permission
+          kubectl auth can-i list secrets --as=system:serviceaccount:default:default -A
+
+          # admission rejection - a policy refusing a valid, authorized object
+          kubectl label ns default pod-security.kubernetes.io/enforce=restricted --dry-run=server
+          ```
+          Notice the errors read completely differently, which is how you
+          tell them apart under pressure.
+      - title: Why order matters
+        cost: 10
+        text: |
+          Mutating webhooks run first because they can change the object -
+          injecting a sidecar, adding a default securityContext. Validating
+          webhooks then see the final version. If validation ran first, a
+          mutation could reintroduce exactly what you were validating against.
+      - title: The 4Cs, briefly
+        cost: 8
+        text: |
+          - **Cloud** - the provider account, network and IAM your cluster sits in
+          - **Cluster** - API server, etcd, RBAC, admission, node hardening
+          - **Container** - image contents, runtime privileges, capabilities
+          - **Code** - your application, its dependencies, TLS, input handling
+
+          Each layer inherits the weaknesses of the ones outside it.
+    solution: |
+      ```bash
+      kubectl create ns klab 2>/dev/null
+      kubectl -n klab create configmap secmodel \
+        --from-literal=layers=cloud,cluster,container,code \
+        --from-literal=stage1=authentication \
+        --from-literal=stage2=authorization \
+        --from-literal=stage3=admission \
+        --from-literal=code_401=authentication \
+        --from-literal=code_403=authorization \
+        --from-literal=mutating_first=true
+      ```
+    solve_script: |
+      kubectl create ns klab 2>/dev/null || true
+      kubectl -n klab create configmap secmodel \
+        --from-literal=layers=cloud,cluster,container,code \
+        --from-literal=stage1=authentication \
+        --from-literal=stage2=authorization \
+        --from-literal=stage3=admission \
+        --from-literal=code_401=authentication \
+        --from-literal=code_403=authorization \
+        --from-literal=mutating_first=true

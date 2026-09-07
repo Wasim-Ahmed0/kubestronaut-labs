@@ -1,0 +1,832 @@
+category: Troubleshooting
+labs:
+
+  - id: tsh-crashloop
+    title: Four broken pods, four different failure modes
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [troubleshooting, crashloopbackoff, imagepullbackoff, events, logs]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: ImagePullBackOff, CrashLoopBackOff, a bad command and a missing ConfigMap.
+    scenario: |
+      Four pods in `triage` are unhealthy. Each fails for a different
+      reason, and each has a different tell:
+
+      - `ImagePullBackOff` -> the events, not the logs
+      - `CrashLoopBackOff` -> `kubectl logs --previous`
+      - `CreateContainerConfigError` -> the events again
+      - `RunContainerError` / immediate exit -> the container's command
+
+      Fix all four. The rule of thumb: `describe` tells you about the pod,
+      `logs` tells you about the process inside it.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/
+    tasks:
+      - text: "`bad-image` uses a tag that does not exist. Point it at `nginx:1.27-alpine`."
+      - text: "`bad-command` runs a binary that is not in the image. Make it run something that stays alive."
+      - text: "`missing-config` references a ConfigMap that does not exist. Create ConfigMap `app-config` in `triage` with key `MODE=production`."
+      - text: "`crashy` exits 1 immediately. Make it stay Running."
+      - text: "All four pods must end up Running and Ready."
+    setup:
+      - kind: shell
+        desc: create four differently broken pods
+        run: |
+          kubectl create ns triage
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: bad-image, namespace: triage}
+          spec:
+            containers:
+              - name: c
+                image: nginx:this-tag-does-not-exist
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: bad-command, namespace: triage}
+          spec:
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["/usr/local/bin/definitely-not-here"]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: missing-config, namespace: triage}
+          spec:
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                envFrom:
+                  - configMapRef:
+                      name: app-config
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: crashy, namespace: triage}
+          spec:
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sh", "-c", "echo starting; exit 1"]
+          YAML
+    verify:
+      - id: bad-image
+        desc: bad-image is Running on a real nginx tag
+        points: 25
+        hint: "kubectl -n triage describe pod bad-image -- read the Events at the bottom"
+        run: |
+          jp pod bad-image '{.spec.containers[0].image}' -n triage | grep -q 'nginx:1.27-alpine' || exit 1
+          RETRY=30 retry bash -c '[ "$(kubectl -n triage get pod bad-image -o jsonpath="{.status.phase}")" = "Running" ]'
+      - id: bad-command
+        desc: bad-command is Running
+        points: 25
+        hint: "the image has no such binary -- busybox has sh, sleep, and not much else"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n triage get pod bad-command -o jsonpath="{.status.phase}")" = "Running" ]'
+      - id: configmap
+        desc: ConfigMap triage/app-config exists with MODE=production
+        points: 25
+        hint: "kubectl -n triage create configmap app-config --from-literal=MODE=production"
+        run: |
+          eq "$(jp cm app-config '{.data.MODE}' -n triage)" "production"
+      - id: missing-config
+        desc: missing-config is now Running with MODE in its environment
+        points: 15
+        hint: "once the ConfigMap exists the kubelet retries by itself"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n triage get pod missing-config -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          eq "$(kubectl -n triage exec missing-config -- sh -c 'echo $MODE' 2>/dev/null | tr -d '\r')" "production"
+      - id: crashy
+        desc: crashy is Running and not restart-looping
+        points: 10
+        hint: "a container that exits is restarted forever -- give it something long-running to do"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n triage get pod crashy -o jsonpath="{.status.phase}")" = "Running" ]'
+      - id: all-ready
+        desc: All four pods report Ready
+        points: 0
+        hint: "kubectl -n triage get pods"
+        run: |
+          RETRY=25 retry bash -c '
+            n=$(kubectl -n triage get pods -o jsonpath="{range .items[*]}{.status.containerStatuses[0].ready}{\"\n\"}{end}" | grep -c "^true$")
+            [ "${n:-0}" -ge 4 ]'
+    hints:
+      - title: The triage order
+        cost: 8
+        text: |
+          ```
+          kubectl -n triage get pods                        # what state?
+          kubectl -n triage describe pod <name> | tail -20   # why?
+          kubectl -n triage logs <name> --previous           # what did it say before it died?
+          ```
+          `describe` covers scheduling, image pull and config errors.
+          `logs --previous` is the only way to see a crashed container's output.
+      - title: Pod specs are mostly immutable
+        cost: 10
+        text: |
+          You can change a pod's `image` in place, but not its `command`.
+          For the rest, export, edit, delete, apply:
+
+          ```
+          kubectl -n triage get pod crashy -o yaml > crashy.yaml
+          # edit command to ["sleep", "3600"]
+          kubectl -n triage delete pod crashy
+          kubectl apply -f crashy.yaml
+          ```
+          `kubectl -n triage set image pod/bad-image c=nginx:1.27-alpine`
+          works without recreating.
+      - title: What each state means
+        cost: 10
+        text: |
+          - `ImagePullBackOff` / `ErrImagePull` - registry, tag or credentials
+          - `CreateContainerConfigError` - a referenced ConfigMap or Secret is missing
+          - `CrashLoopBackOff` - the process starts then exits; read the logs
+          - `RunContainerError` - the entrypoint could not be executed at all
+    solution: |
+      ```bash
+      kubectl -n triage describe pod bad-image | tail -10
+      kubectl -n triage set image pod/bad-image c=nginx:1.27-alpine
+
+      kubectl -n triage create configmap app-config --from-literal=MODE=production
+
+      kubectl -n triage delete pod bad-command crashy
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: bad-command, namespace: triage}
+      spec:
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: crashy, namespace: triage}
+      spec:
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sh", "-c", "echo starting; sleep 3600"]
+      YAML
+
+      kubectl -n triage delete pod missing-config --ignore-not-found
+      ```
+    solve_script: |
+      kubectl -n triage set image pod/bad-image c=nginx:1.27-alpine
+      kubectl -n triage create configmap app-config --from-literal=MODE=production
+      kubectl -n triage delete pod bad-command crashy --wait=true
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: bad-command, namespace: triage}
+      spec:
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: crashy, namespace: triage}
+      spec:
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sh", "-c", "echo starting; sleep 3600"]
+      YAML
+      sleep 30
+
+  - id: tsh-events-and-logs
+    title: Investigate with events, logs and ephemeral debug containers
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [events, logs, kubectl debug, ephemeral containers, troubleshooting]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: How to look inside a distroless container that has no shell.
+    scenario: |
+      Not every container has a shell. Distroless and scratch images are
+      good practice and a debugging nightmare - `kubectl exec ... -- sh`
+      simply fails.
+
+      `kubectl debug` attaches an *ephemeral container* to a running pod:
+      your own image, sharing the target's network namespace (and optionally
+      its process namespace), without restarting anything.
+
+      Use it on a pod you cannot exec into, and gather evidence properly.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/
+      - https://kubernetes.io/docs/reference/kubectl/generated/kubectl_debug/
+    tasks:
+      - text: "The pod `noshell` in `probe` runs a distroless image with no shell. Attach an ephemeral debug container to it using `kubectl debug`."
+      - text: "From inside that debug container, confirm the pod is serving HTTP on port 8080."
+      - text: "Record the result in a ConfigMap `debuginfo` in `probe`: key `method` = `ephemeral`, key `port` = `8080`."
+      - text: "Also record under key `events_command` the kubectl command that lists namespace events sorted by time (use `.metadata.creationTimestamp` as the sort key)."
+    setup:
+      - kind: shell
+        desc: run a shell-less pod serving http
+        run: |
+          kubectl create ns probe
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: noshell, namespace: probe, labels: {app: noshell}}
+          spec:
+            containers:
+              - name: app
+                image: gcr.io/distroless/static-debian12:nonroot
+                command: ["/bin/true"]
+          YAML
+          kubectl -n probe delete pod noshell --ignore-not-found --wait=true
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: noshell, namespace: probe, labels: {app: noshell}}
+          spec:
+            containers:
+              - name: app
+                image: nginxinc/nginx-unprivileged:1.27-alpine
+                ports: [{containerPort: 8080}]
+          YAML
+          kubectl -n probe wait --for=condition=Ready pod/noshell --timeout=240s
+    verify:
+      - id: ephemeral
+        desc: An ephemeral container was attached to the noshell pod
+        points: 40
+        hint: "kubectl -n probe debug -it noshell --image=busybox:1.36 --target=app"
+        run: |
+          jp pod noshell '{.spec.ephemeralContainers[*].name}' -n probe | grep -q .
+      - id: recorded
+        desc: The ConfigMap records the method and the port
+        points: 30
+        hint: "kubectl -n probe create configmap debuginfo --from-literal=method=ephemeral --from-literal=port=8080"
+        run: |
+          eq "$(jp cm debuginfo '{.data.method}' -n probe | tr -d ' ')" "ephemeral" || exit 1
+          eq "$(jp cm debuginfo '{.data.port}' -n probe | tr -d ' ')" "8080"
+      - id: events-cmd
+        desc: The recorded events command is right
+        points: 30
+        hint: "kubectl get events --sort-by=.metadata.creationTimestamp"
+        run: |
+          got=$(jp cm debuginfo '{.data.events_command}' -n probe)
+          echo "$got" | grep -q 'get events' || exit 1
+          echo "$got" | grep -q 'sort-by' || exit 1
+          echo "$got" | grep -q 'creationTimestamp'
+    hints:
+      - title: Attaching a debug container
+        cost: 10
+        text: |
+          ```
+          kubectl -n probe debug -it noshell --image=busybox:1.36 --target=app
+          ```
+          `--target=app` shares the process namespace of that container, so
+          you can see its processes. Without it you still share the network
+          namespace, which is enough to curl localhost.
+      - title: Testing from inside
+        cost: 8
+        text: |
+          Inside the ephemeral container:
+
+          ```
+          wget -qO- 127.0.0.1:8080 | head -3
+          netstat -tlnp 2>/dev/null || cat /proc/net/tcp
+          ```
+          `127.0.0.1` works because you share the pod's network namespace.
+      - title: The other debug modes
+        cost: 10
+        text: |
+          - `kubectl debug POD --image=X --target=C` - ephemeral container in a running pod
+          - `kubectl debug POD --copy-to=NEW --set-image=*=busybox` - a copy with different images
+          - `kubectl debug node/NODE --image=busybox` - a pod on the node with its filesystem at `/host`
+
+          The third one is how you inspect a node when you cannot ssh to it.
+    solution: |
+      ```bash
+      kubectl -n probe debug -it noshell --image=busybox:1.36 --target=app -- \
+        sh -c 'wget -qO- 127.0.0.1:8080 | head -3'
+
+      kubectl -n probe create configmap debuginfo \
+        --from-literal=method=ephemeral \
+        --from-literal=port=8080 \
+        --from-literal=events_command='kubectl get events --sort-by=.metadata.creationTimestamp'
+      ```
+    solve_script: |
+      kubectl -n probe debug noshell --image=busybox:1.36 --target=app -q -- sleep 30 >/dev/null 2>&1 || true
+      sleep 15
+      kubectl -n probe create configmap debuginfo \
+        --from-literal=method=ephemeral \
+        --from-literal=port=8080 \
+        --from-literal=events_command='kubectl get events --sort-by=.metadata.creationTimestamp'
+  - id: tsh-broken-deployment
+    title: A Deployment that will not become available
+    difficulty: hard
+    exams: [CKA, CKAD]
+    concepts: [deployments, troubleshooting, probes, resources, selectors]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: Three independent faults keeping one Deployment at 0/3 ready.
+    scenario: |
+      `orders` in the `prod` namespace has been at `0/3` for an hour. There
+      is not one bug - there are three, stacked:
+
+      1. The readiness probe points at a port nothing listens on
+      2. The memory limit is far too small, so containers get OOMKilled
+      3. The Service in front of it selects the wrong label
+
+      Work through them methodically. Fixing only one will not turn the
+      Deployment green.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-application/
+    tasks:
+      - text: "Get Deployment `prod/orders` to 3/3 ready."
+      - text: "The readiness probe must check a port the container actually serves."
+      - text: "The memory limit must be large enough for nginx to run (at least 64Mi)."
+      - text: "Service `prod/orders` must have endpoints."
+    setup:
+      - kind: shell
+        desc: deploy orders with three stacked faults
+        run: |
+          kubectl create ns prod
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: orders, namespace: prod}
+          spec:
+            replicas: 3
+            selector:
+              matchLabels: {app: orders}
+            template:
+              metadata:
+                labels: {app: orders}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.27-alpine
+                    ports: [{containerPort: 80}]
+                    resources:
+                      limits: {memory: "4Mi", cpu: "200m"}
+                      requests: {memory: "4Mi", cpu: "50m"}
+                    readinessProbe:
+                      httpGet: {path: /, port: 9999}
+                      periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: orders, namespace: prod}
+          spec:
+            selector: {app: order-service}
+            ports: [{port: 80, targetPort: 80}]
+          YAML
+          sleep 20
+    verify:
+      - id: probe
+        desc: The readiness probe targets port 80
+        points: 25
+        hint: "the container serves on 80, not 9999"
+        run: |
+          eq "$(jp deploy orders '{.spec.template.spec.containers[0].readinessProbe.httpGet.port}' -n prod)" "80"
+      - id: memory
+        desc: The memory limit is at least 64Mi
+        points: 25
+        hint: "4Mi is not enough for nginx -- containers get OOMKilled immediately"
+        run: |
+          lim=$(jp deploy orders '{.spec.template.spec.containers[0].resources.limits.memory}' -n prod)
+          case "$lim" in
+            *Gi) exit 0 ;;
+            *Mi) [ "${lim%Mi}" -ge 64 ] ;;
+            *) exit 1 ;;
+          esac
+      - id: ready
+        desc: The Deployment reports 3 ready replicas
+        points: 30
+        hint: "kubectl -n prod rollout status deploy/orders"
+        run: |
+          rollout prod deploy/orders 240s || exit 1
+          eq "$(jp deploy orders '{.status.readyReplicas}' -n prod)" "3"
+      - id: endpoints
+        desc: The orders Service has endpoints
+        points: 20
+        hint: "compare the Service selector with the pod labels"
+        run: |
+          eq "$(jp svc orders '{.spec.selector.app}' -n prod)" "orders" || exit 1
+          RETRY=20 retry bash -c "kubectl -n prod get endpointslices -l kubernetes.io/service-name=orders \
+            -o jsonpath='{.items[*].endpoints[*].addresses[*]}' | grep -q ."
+    hints:
+      - title: Read the pod, not the Deployment
+        cost: 8
+        text: |
+          ```
+          kubectl -n prod get pods
+          kubectl -n prod describe pod <one of them> | tail -25
+          ```
+          You will see `OOMKilled` in the last state and readiness probe
+          failures in the events. Two separate problems, both visible here.
+      - title: Fixing the workload
+        cost: 10
+        text: |
+          ```
+          kubectl -n prod set resources deploy/orders --limits=memory=128Mi --requests=memory=64Mi
+          kubectl -n prod patch deploy orders --type=strategic -p \
+            '{"spec":{"template":{"spec":{"containers":[{"name":"web",
+              "readinessProbe":{"httpGet":{"path":"/","port":80}}}]}}}}'
+          ```
+      - title: And the Service
+        cost: 8
+        text: |
+          ```
+          kubectl -n prod get svc orders -o jsonpath='{.spec.selector}'   # app=order-service
+          kubectl -n prod get pods --show-labels                          # app=orders
+          kubectl -n prod patch svc orders -p '{"spec":{"selector":{"app":"orders"}}}'
+          ```
+    solution: |
+      ```bash
+      kubectl -n prod describe pod -l app=orders | tail -25    # OOMKilled + probe failures
+
+      kubectl -n prod set resources deploy/orders \
+        --limits=memory=128Mi,cpu=200m --requests=memory=64Mi,cpu=50m
+
+      kubectl -n prod patch deploy orders --type=strategic -p \
+        '{"spec":{"template":{"spec":{"containers":[{"name":"web",
+          "readinessProbe":{"httpGet":{"path":"/","port":80}}}]}}}}'
+
+      kubectl -n prod patch svc orders -p '{"spec":{"selector":{"app":"orders"}}}'
+
+      kubectl -n prod rollout status deploy/orders
+      kubectl -n prod get endpointslices
+      ```
+    solve_script: |
+      kubectl -n prod set resources deploy/orders --limits=memory=128Mi,cpu=200m --requests=memory=64Mi,cpu=50m
+      kubectl -n prod patch deploy orders --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"web","readinessProbe":{"httpGet":{"path":"/","port":80}}}]}}}}'
+      kubectl -n prod patch svc orders -p '{"spec":{"selector":{"app":"orders"}}}'
+      kubectl -n prod rollout status deploy/orders --timeout=300s
+
+  - id: tsh-dns-broken
+    title: Cluster DNS has stopped resolving
+    difficulty: hard
+    exams: [CKA]
+    concepts: [coredns, dns, troubleshooting, configmap, service discovery]
+    par_minutes: 15
+    estimated_minutes: 20
+    destructive: false
+    blurb: Nothing can resolve Service names. Follow the chain from pod to CoreDNS.
+    scenario: |
+      Applications are failing with name resolution errors. Every Service
+      still exists and every pod is Running, but no name resolves.
+
+      The resolution chain is:
+
+      pod's `/etc/resolv.conf` -> the `kube-dns` Service ClusterIP ->
+      CoreDNS pod endpoints -> the CoreDNS Corefile
+
+      Walk that chain until you find the break, then repair it.
+    docs:
+      - https://kubernetes.io/docs/tasks/administer-cluster/dns-debugging-resolution/
+    tasks:
+      - text: "Find out why DNS resolution is failing."
+      - text: "Repair the CoreDNS configuration so cluster names resolve again."
+      - text: "A pod in `dnsfix` must be able to resolve `kubernetes.default.svc.cluster.local`."
+    setup:
+      - kind: shell
+        desc: corrupt the CoreDNS Corefile
+        timeout: 300
+        run: |
+          kubectl create ns dnsfix
+          kubectl -n dnsfix run probe --image=busybox:1.36 --command -- sleep 86400
+          kubectl -n kube-system get cm coredns -o yaml > /tmp/klab-coredns-backup.yaml 2>/dev/null || true
+          # break the kubernetes plugin's cluster domain
+          kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' \
+            | sed 's/kubernetes cluster\.local/kubernetes klab.broken.local/' > /tmp/klab-corefile
+          kubectl -n kube-system create cm coredns --from-file=Corefile=/tmp/klab-corefile \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n kube-system rollout restart deploy/coredns
+          kubectl -n kube-system rollout status deploy/coredns --timeout=180s
+          kubectl -n dnsfix wait --for=condition=Ready pod/probe --timeout=180s
+    verify:
+      - id: corefile
+        desc: The CoreDNS Corefile serves cluster.local again
+        points: 40
+        hint: "kubectl -n kube-system get cm coredns -o yaml -- look at the kubernetes plugin line"
+        run: |
+          kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' \
+            | grep -q 'kubernetes cluster\.local'
+      - id: coredns-healthy
+        desc: The CoreDNS pods are running with the new config
+        points: 20
+        hint: "kubectl -n kube-system rollout restart deploy/coredns after editing the ConfigMap"
+        run: |
+          rollout kube-system deploy/coredns 180s
+      - id: resolves
+        desc: A pod can resolve kubernetes.default.svc.cluster.local
+        points: 40
+        hint: "kubectl -n dnsfix exec probe -- nslookup kubernetes.default.svc.cluster.local"
+        run: |
+          RETRY=30 retry kubectl -n dnsfix exec probe -- \
+            nslookup kubernetes.default.svc.cluster.local
+    hints:
+      - title: Prove where it breaks
+        cost: 10
+        text: |
+          ```
+          kubectl -n dnsfix exec probe -- cat /etc/resolv.conf
+          kubectl -n dnsfix exec probe -- nslookup kubernetes.default
+          kubectl -n kube-system get svc kube-dns
+          kubectl -n kube-system get endpointslices -l k8s-app=kube-dns
+          kubectl -n kube-system logs -l k8s-app=kube-dns --tail=30
+          ```
+          resolv.conf is fine, the Service has endpoints, the pods are up -
+          so the problem is CoreDNS's own configuration.
+      - title: Reading the Corefile
+        cost: 10
+        text: |
+          ```
+          kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}'
+          ```
+          The `kubernetes` plugin line declares which zones CoreDNS is
+          authoritative for. It should read `kubernetes cluster.local
+          in-addr.arpa ip6.arpa`. If the zone is wrong, CoreDNS simply does
+          not answer for cluster names.
+      - title: Fixing and reloading
+        cost: 12
+        text: |
+          ```
+          kubectl -n kube-system edit cm coredns
+          # change the kubernetes zone back to cluster.local
+          kubectl -n kube-system rollout restart deploy/coredns
+          kubectl -n kube-system rollout status deploy/coredns
+          ```
+          CoreDNS does reload on its own within a minute or two, but a
+          rollout restart makes it immediate and is what you want under
+          exam time pressure.
+    solution: |
+      ```bash
+      kubectl -n dnsfix exec probe -- nslookup kubernetes.default    # fails
+      kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}'
+      #   -> kubernetes klab.broken.local ...
+
+      kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' \
+        | sed 's/kubernetes klab\.broken\.local/kubernetes cluster.local/' > /tmp/corefile
+
+      kubectl -n kube-system create cm coredns --from-file=Corefile=/tmp/corefile \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      kubectl -n kube-system rollout restart deploy/coredns
+      kubectl -n kube-system rollout status deploy/coredns
+
+      kubectl -n dnsfix exec probe -- nslookup kubernetes.default.svc.cluster.local
+      ```
+    solve_script: |
+      kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' \
+        | sed 's/kubernetes klab\.broken\.local/kubernetes cluster.local/' > /tmp/klab-corefile-fix
+      kubectl -n kube-system create cm coredns --from-file=Corefile=/tmp/klab-corefile-fix \
+        --dry-run=client -o yaml | kubectl apply -f -
+      kubectl -n kube-system rollout restart deploy/coredns
+      kubectl -n kube-system rollout status deploy/coredns --timeout=180s
+      sleep 20
+
+  - id: tsh-node-notready
+    title: A node has gone NotReady
+    difficulty: hard
+    exams: [CKA]
+    concepts: [kubelet, node conditions, troubleshooting, systemd]
+    par_minutes: 15
+    estimated_minutes: 20
+    cluster:
+      nodes: 2
+    destructive: true
+    blurb: The kubelet stopped. Find out how you would know, and start it again.
+    scenario: |
+      A worker node is `NotReady` and its pods are being marked for
+      eviction. On a real cluster the causes are usually: the kubelet is
+      stopped, the container runtime is stopped, disk pressure, or the
+      kubelet cannot reach the API server.
+
+      Work through it properly - look at the node's conditions first, then
+      get onto the node and look at the service.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-cluster/
+      - https://kubernetes.io/docs/concepts/architecture/nodes/#condition
+    tasks:
+      - text: "Identify which node is NotReady."
+      - text: "Get onto it and restart the kubelet so the node returns to Ready."
+      - text: "Record the diagnosis in a ConfigMap `nodeinfo` in `klab`: key `node` = the node's name, key `unit` = the systemd unit that was down."
+      - text: "All nodes must report Ready at the end."
+    setup:
+      - kind: shell
+        desc: stop the kubelet on a worker
+        timeout: 300
+        run: |
+          kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+          NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" \
+            --format '{{.Names}}' | grep -v control-plane | head -1)
+          docker exec "$NODE" systemctl stop kubelet
+          sleep 45
+    verify:
+      - id: recorded
+        desc: You identified the node that was down
+        points: 30
+        hint: "kubectl get nodes -- and check the Ready condition's message"
+        run: |
+          got=$(jp cm nodeinfo '{.data.node}' -n klab | tr -d ' ')
+          [ -n "$got" ] || exit 1
+          has node "$got" || exit 1
+          echo "$got" | grep -qv 'control-plane'
+      - id: unit
+        desc: You identified the service that had stopped
+        points: 20
+        hint: "systemctl status kubelet"
+        run: |
+          jp cm nodeinfo '{.data.unit}' -n klab | grep -q 'kubelet'
+      - id: ready
+        desc: Every node is Ready again
+        points: 50
+        hint: "knode <node> systemctl start kubelet"
+        run: |
+          RETRY=40 retry bash -c '
+            total=$(kubectl get nodes --no-headers | wc -l | tr -d " ")
+            ready=$(kubectl get nodes -o jsonpath="{range .items[*]}{.status.conditions[?(@.type==\"Ready\")].status}{\"\n\"}{end}" | grep -c "^True$")
+            [ "$total" -gt 0 ] && [ "$total" = "$ready" ]'
+    hints:
+      - title: Start from the node object
+        cost: 8
+        text: |
+          ```
+          kubectl get nodes
+          kubectl describe node <the NotReady one> | grep -A10 Conditions
+          ```
+          The Ready condition's message is usually
+          `Kubelet stopped posting node status`, which means the node
+          controller stopped hearing from the kubelet.
+      - title: Onto the node
+        cost: 10
+        text: |
+          ```
+          knode                                   # list the node containers
+          knode kubestronaut-worker systemctl status kubelet
+          knode kubestronaut-worker journalctl -u kubelet -n 50 --no-pager
+          ```
+      - title: Bringing it back
+        cost: 8
+        text: |
+          ```
+          knode kubestronaut-worker systemctl start kubelet
+          knode kubestronaut-worker systemctl enable kubelet
+          ```
+          The node goes Ready within about 20 seconds. On a real cluster
+          also check `systemctl status containerd`.
+    solution: |
+      ```bash
+      kubectl get nodes                      # kubestronaut-worker NotReady
+      kubectl describe node kubestronaut-worker | grep -A10 Conditions
+
+      docker exec kubestronaut-worker systemctl status kubelet     # inactive (dead)
+      docker exec kubestronaut-worker systemctl start kubelet
+
+      kubectl get nodes -w                   # back to Ready
+
+      kubectl -n klab create configmap nodeinfo \
+        --from-literal=node=kubestronaut-worker \
+        --from-literal=unit=kubelet.service
+      ```
+    solve_script: |
+      NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" --format '{{.Names}}' | grep -v control-plane | head -1)
+      docker exec "$NODE" systemctl start kubelet
+      kubectl -n klab create configmap nodeinfo \
+        --from-literal=node="$NODE" --from-literal=unit=kubelet.service
+      sleep 40
+
+  - id: tsh-apiserver-down
+    title: The API server will not come up
+    difficulty: expert
+    exams: [CKA]
+    concepts: [static pods, kube-apiserver, troubleshooting, control plane, kubelet logs]
+    par_minutes: 18
+    estimated_minutes: 25
+    destructive: true
+    blurb: kubectl itself is broken. Fix a control plane you cannot query.
+    scenario: |
+      Someone edited `/etc/kubernetes/manifests/kube-apiserver.yaml` and
+      now nothing works - `kubectl` cannot even connect.
+
+      This is the scenario that separates people who have practised from
+      people who have only read. With the API server down, your tools are:
+
+      - `crictl ps -a` on the node, to see containers the kubelet is running
+      - `crictl logs <id>` to see why the API server container is dying
+      - `journalctl -u kubelet` for the kubelet's own view
+      - the manifest file itself
+
+      Get the cluster back.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-cluster/
+      - https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/
+    tasks:
+      - text: "Find why the API server is not starting."
+      - text: "Repair `/etc/kubernetes/manifests/kube-apiserver.yaml` on the control plane node."
+      - text: "`kubectl get nodes` must work again and every control plane pod must be Running."
+    setup:
+      - kind: shell
+        desc: corrupt the API server manifest
+        timeout: 300
+        run: |
+          NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" \
+            --format '{{.Names}}' | grep control-plane | head -1)
+          docker exec "$NODE" cp /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/kube-apiserver.yaml.bak
+          # point the API server at an etcd that is not there
+          docker exec "$NODE" sh -c \
+            "sed -i 's|--etcd-servers=https://127.0.0.1:2379|--etcd-servers=https://127.0.0.1:2999|' \
+             /etc/kubernetes/manifests/kube-apiserver.yaml"
+          sleep 25
+    verify:
+      - id: api-up
+        desc: The API server is answering again
+        points: 40
+        hint: "kubectl get nodes -- if it hangs, the API server is still down"
+        run: |
+          RETRY=45 retry kubectl get --raw /readyz
+      - id: manifest-fixed
+        desc: The manifest points at a working etcd endpoint
+        points: 30
+        hint: "compare --etcd-servers in the manifest with --listen-client-urls in etcd.yaml"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          docker exec "$node" grep -q 'etcd-servers=https://127.0.0.1:2379' \
+            /etc/kubernetes/manifests/kube-apiserver.yaml
+      - id: control-plane-healthy
+        desc: Every control plane static pod is Running
+        points: 30
+        hint: "kubectl -n kube-system get pods"
+        run: |
+          RETRY=30 retry bash -c '
+            n=$(kubectl -n kube-system get pods -l tier=control-plane \
+                 -o jsonpath="{range .items[*]}{.status.phase}{\"\n\"}{end}" | grep -c Running)
+            [ "${n:-0}" -ge 3 ]'
+    hints:
+      - title: Working without kubectl
+        cost: 10
+        text: |
+          Get onto the node and use crictl - it talks to the container
+          runtime directly, no API server involved:
+
+          ```
+          knode kubestronaut-control-plane
+          crictl ps -a | head
+          crictl logs $(crictl ps -a --name kube-apiserver -q | head -1)
+          ```
+      - title: Where the error will be
+        cost: 12
+        text: |
+          The API server logs will be full of connection failures to etcd.
+          Compare the two manifests:
+
+          ```
+          grep etcd-servers /etc/kubernetes/manifests/kube-apiserver.yaml
+          grep listen-client-urls /etc/kubernetes/manifests/etcd.yaml
+          ```
+          They must agree on the port. etcd serves clients on 2379.
+      - title: Editing on the node
+        cost: 10
+        text: |
+          kind nodes have no vi, so use sed:
+
+          ```
+          docker exec kubestronaut-control-plane sh -c \
+            "sed -i 's|--etcd-servers=https://127.0.0.1:2999|--etcd-servers=https://127.0.0.1:2379|' \
+             /etc/kubernetes/manifests/kube-apiserver.yaml"
+          ```
+          The kubelet notices the file change within seconds and restarts
+          the static pod. Give it 30 to 60 seconds before you panic.
+    solution: |
+      ```bash
+      NODE=kubestronaut-control-plane
+
+      # 1. see what the kubelet is doing
+      docker exec $NODE crictl ps -a | grep apiserver
+
+      # 2. read the container's logs
+      docker exec $NODE sh -c 'crictl logs $(crictl ps -a --name kube-apiserver -q | head -1) 2>&1 | tail -20'
+      #    -> "connection refused" to 127.0.0.1:2999
+
+      # 3. compare with what etcd actually listens on
+      docker exec $NODE grep listen-client-urls /etc/kubernetes/manifests/etcd.yaml
+
+      # 4. fix the manifest
+      docker exec $NODE sh -c \
+        "sed -i 's|--etcd-servers=https://127.0.0.1:2999|--etcd-servers=https://127.0.0.1:2379|' \
+         /etc/kubernetes/manifests/kube-apiserver.yaml"
+
+      # 5. wait for the kubelet to restart the static pod
+      kubectl get nodes
+      ```
+    solve_script: |
+      NODE=$(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" --format '{{.Names}}' | grep control-plane | head -1)
+      docker exec "$NODE" sh -c "sed -i 's|--etcd-servers=https://127.0.0.1:2999|--etcd-servers=https://127.0.0.1:2379|' /etc/kubernetes/manifests/kube-apiserver.yaml"
+      for i in $(seq 1 60); do
+        if kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
+        sleep 5
+      done
+      sleep 20
+

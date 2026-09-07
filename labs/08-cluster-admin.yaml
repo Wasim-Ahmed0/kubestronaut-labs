@@ -1,0 +1,683 @@
+category: Cluster Architecture & Lifecycle
+labs:
+
+  - id: adm-etcd-backup
+    title: Back up etcd - the one that saves your job
+    difficulty: hard
+    exams: [CKA]
+    concepts: [etcd, backup, etcdctl, certificates, disaster recovery]
+    par_minutes: 14
+    estimated_minutes: 19
+    blurb: Take a real snapshot with the right certs, and know where they live.
+    scenario: |
+      etcd holds the entire cluster state. Everything else can be rebuilt;
+      etcd cannot. Taking a snapshot is close to guaranteed on the CKA.
+
+      The whole task is really "find the four values etcdctl needs":
+
+      - `--endpoints` - from `--listen-client-urls` in the etcd manifest
+      - `--cacert` - `/etc/kubernetes/pki/etcd/ca.crt`
+      - `--cert` and `--key` - the server (or a healthcheck client) pair
+
+      On this cluster etcdctl lives inside the etcd container, so you run it
+      with `kubectl exec`. On a classic kubeadm host it is on the node
+      itself - the flags are identical either way.
+    docs:
+      - https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/#backing-up-an-etcd-cluster
+    tasks:
+      - text: "Take an etcd snapshot and save it to `/var/lib/etcd/klab-snapshot.db` on the control plane node."
+      - text: "Record the certificate paths you used in a ConfigMap `etcdinfo` in `klab`: keys `cacert`, `cert`, `key`."
+      - text: "Record the client endpoint you used under key `endpoint`."
+      - text: "The snapshot file must be a real, non-trivial etcd snapshot (megabytes, not bytes)."
+    setup:
+      - kind: shell
+        desc: prepare the klab namespace and clear any old snapshot
+        run: |
+          kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+          for n in $(docker ps --filter "label=io.x-k8s.kind.cluster=kubestronaut" --format '{{.Names}}'); do
+            docker exec "$n" rm -f /var/lib/etcd/klab-snapshot.db 2>/dev/null || true
+          done
+    verify:
+      - id: snapshot-exists
+        desc: A snapshot file exists at /var/lib/etcd/klab-snapshot.db on the control plane
+        points: 40
+        hint: "etcdctl snapshot save /var/lib/etcd/klab-snapshot.db with the three cert flags"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          [ -n "$node" ] || exit 1
+          docker exec "$node" test -f /var/lib/etcd/klab-snapshot.db
+      - id: snapshot-real
+        desc: The snapshot is a real etcd database, not an empty file
+        points: 25
+        hint: "a healthy snapshot of even an idle cluster is a few megabytes"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          size=$(docker exec "$node" stat -c %s /var/lib/etcd/klab-snapshot.db 2>/dev/null || echo 0)
+          [ "${size:-0}" -gt 500000 ]
+      - id: certs
+        desc: You recorded the correct etcd certificate paths
+        points: 25
+        hint: "they are all under /etc/kubernetes/pki/etcd/"
+        run: |
+          eq "$(jp cm etcdinfo '{.data.cacert}' -n klab | tr -d ' ')" "/etc/kubernetes/pki/etcd/ca.crt" || exit 1
+          jp cm etcdinfo '{.data.cert}' -n klab | grep -q '^/etc/kubernetes/pki/etcd/.*\.crt$' || exit 1
+          jp cm etcdinfo '{.data.key}' -n klab | grep -q '^/etc/kubernetes/pki/etcd/.*\.key$'
+      - id: endpoint
+        desc: You recorded the etcd client endpoint
+        points: 10
+        hint: "look at --listen-client-urls in /etc/kubernetes/manifests/etcd.yaml"
+        run: |
+          jp cm etcdinfo '{.data.endpoint}' -n klab | grep -q '2379'
+    hints:
+      - title: Finding the flags
+        cost: 8
+        text: |
+          Read them straight off the running etcd static pod:
+
+          ```
+          kubectl -n kube-system get pod -l component=etcd \
+            -o jsonpath='{.items[0].spec.containers[0].command}' | tr ',' '\n'
+          ```
+          You are looking for `--listen-client-urls`, `--trusted-ca-file`,
+          `--cert-file` and `--key-file`.
+      - title: Running etcdctl here
+        cost: 10
+        text: |
+          ```
+          ETCD=$(kubectl -n kube-system get pod -l component=etcd -o name | head -1)
+
+          kubectl -n kube-system exec $ETCD -- etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/server.crt \
+            --key=/etc/kubernetes/pki/etcd/server.key \
+            snapshot save /var/lib/etcd/klab-snapshot.db
+          ```
+          `/var/lib/etcd` is a hostPath, so the file really lands on the node.
+      - title: On a real CKA cluster
+        cost: 8
+        text: |
+          There you would ssh to the control plane and run etcdctl directly:
+
+          ```
+          ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+            --cacert=... --cert=... --key=... snapshot save /opt/backup.db
+          ```
+          Same flags. Only the way you reach the binary differs.
+    solution: |
+      ```bash
+      ETCD=$(kubectl -n kube-system get pod -l component=etcd -o name | head -1)
+
+      kubectl -n kube-system exec $ETCD -- etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        snapshot save /var/lib/etcd/klab-snapshot.db
+
+      kubectl -n klab create configmap etcdinfo \
+        --from-literal=cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --from-literal=cert=/etc/kubernetes/pki/etcd/server.crt \
+        --from-literal=key=/etc/kubernetes/pki/etcd/server.key \
+        --from-literal=endpoint=https://127.0.0.1:2379
+      ```
+    solve_script: |
+      ETCD=$(kubectl -n kube-system get pod -l component=etcd -o name | head -1)
+      kubectl -n kube-system exec $ETCD -- etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        snapshot save /var/lib/etcd/klab-snapshot.db
+      kubectl -n klab create configmap etcdinfo \
+        --from-literal=cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --from-literal=cert=/etc/kubernetes/pki/etcd/server.crt \
+        --from-literal=key=/etc/kubernetes/pki/etcd/server.key \
+        --from-literal=endpoint=https://127.0.0.1:2379
+
+  - id: adm-certificates-csr
+    title: Certificates, expiry and issuing a client cert through the CSR API
+    difficulty: hard
+    exams: [CKA, CKS]
+    concepts: [certificates, csr api, kubeadm certs, authentication, x509]
+    par_minutes: 18
+    estimated_minutes: 24
+    blurb: Onboard a new human user the way Kubernetes actually intends.
+    scenario: |
+      Kubernetes has no User objects. A "user" is just a client certificate
+      whose Common Name the API server trusts - the CN becomes the username
+      and the Organization becomes the group.
+
+      A new engineer, `dev-anna`, needs access. Generate a key and CSR,
+      submit it through the `CertificateSigningRequest` API, approve it, and
+      pull the signed certificate back out.
+
+      While you are in there, check when the cluster's own certificates
+      expire - a classic CKA question.
+    docs:
+      - https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/
+      - https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-certs/
+    tasks:
+      - text: "Generate a 2048-bit RSA key and a CSR with CN `dev-anna` and O `developers`."
+      - text: "Submit it as a CertificateSigningRequest named `dev-anna` with signerName `kubernetes.io/kube-apiserver-client` and usage `client auth`, expiry 86400 seconds."
+      - text: "Approve the CSR so it is issued."
+      - text: "Record the expiry date of the cluster's `apiserver` certificate in a ConfigMap `certinfo` in `klab`, key `apiserver_expires` (format `YYYY-MM-DD`)."
+    setup:
+      - kind: shell
+        desc: prepare the klab namespace and clear old CSRs
+        run: |
+          kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+          kubectl delete csr dev-anna --ignore-not-found
+    verify:
+      - id: csr-exists
+        desc: A CSR named dev-anna exists with the right signer and usage
+        points: 30
+        hint: "signerName: kubernetes.io/kube-apiserver-client and usages: [client auth]"
+        run: |
+          eq "$(jp csr dev-anna '{.spec.signerName}')" "kubernetes.io/kube-apiserver-client" || exit 1
+          jp csr dev-anna '{.spec.usages[*]}' | grep -q 'client auth'
+      - id: approved
+        desc: The CSR is Approved and Issued
+        points: 30
+        hint: "kubectl certificate approve dev-anna"
+        run: |
+          jp csr dev-anna '{.status.conditions[*].type}' | grep -q Approved || exit 1
+          RETRY=15 retry bash -c 'kubectl get csr dev-anna -o jsonpath="{.status.certificate}" | grep -q .'
+      - id: identity
+        desc: The issued certificate really carries CN=dev-anna and O=developers
+        points: 25
+        hint: "decode it: kubectl get csr dev-anna -o jsonpath='{.status.certificate}' | base64 -d | openssl x509 -noout -subject"
+        run: |
+          subj=$(kubectl get csr dev-anna -o jsonpath='{.status.certificate}' | base64 -d 2>/dev/null \
+                 | openssl x509 -noout -subject 2>/dev/null)
+          echo "$subj" | grep -q 'dev-anna' || exit 1
+          echo "$subj" | grep -qi 'developers'
+      - id: expiry
+        desc: You recorded when the apiserver certificate expires
+        points: 15
+        hint: "docker exec <control-plane> kubeadm certs check-expiration"
+        run: |
+          node=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+          want=$(docker exec "$node" sh -c \
+            "openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -enddate" 2>/dev/null \
+            | cut -d= -f2)
+          [ -n "$want" ] || exit 1
+          wanty=$(docker exec "$node" sh -c \
+            "date -u -d \"$want\" +%Y-%m-%d" 2>/dev/null)
+          got=$(jp cm certinfo '{.data.apiserver_expires}' -n klab | tr -d ' ')
+          eq "$got" "$wanty"
+    hints:
+      - title: Generating the key and CSR
+        cost: 10
+        text: |
+          ```
+          openssl genrsa -out anna.key 2048
+          openssl req -new -key anna.key -out anna.csr \
+            -subj "/CN=dev-anna/O=developers"
+          ```
+          The `/CN=` is the username Kubernetes will see; `/O=` becomes a group.
+      - title: The CertificateSigningRequest object
+        cost: 12
+        text: |
+          `request` must be the base64 of the CSR **with no line wrapping**:
+
+          ```
+          cat <<YAML | kubectl apply -f -
+          apiVersion: certificates.k8s.io/v1
+          kind: CertificateSigningRequest
+          metadata:
+            name: dev-anna
+          spec:
+            request: $(cat anna.csr | base64 | tr -d '\n')
+            signerName: kubernetes.io/kube-apiserver-client
+            expirationSeconds: 86400
+            usages:
+              - client auth
+          YAML
+
+          kubectl certificate approve dev-anna
+          ```
+      - title: Checking certificate expiry
+        cost: 10
+        text: |
+          ```
+          docker exec kubestronaut-control-plane kubeadm certs check-expiration
+          ```
+          or straight from openssl:
+          ```
+          docker exec kubestronaut-control-plane \
+            openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -enddate
+          ```
+          Renewal is `kubeadm certs renew all`, followed by restarting the
+          control plane static pods.
+    solution: |
+      ```bash
+      openssl genrsa -out anna.key 2048
+      openssl req -new -key anna.key -out anna.csr -subj "/CN=dev-anna/O=developers"
+
+      cat <<YAML | kubectl apply -f -
+      apiVersion: certificates.k8s.io/v1
+      kind: CertificateSigningRequest
+      metadata:
+        name: dev-anna
+      spec:
+        request: $(cat anna.csr | base64 | tr -d '\n')
+        signerName: kubernetes.io/kube-apiserver-client
+        expirationSeconds: 86400
+        usages:
+          - client auth
+      YAML
+
+      kubectl certificate approve dev-anna
+      kubectl get csr dev-anna -o jsonpath='{.status.certificate}' | base64 -d > anna.crt
+
+      NODE=kubestronaut-control-plane
+      END=$(docker exec $NODE openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -enddate | cut -d= -f2)
+      DATE=$(docker exec $NODE date -u -d "$END" +%Y-%m-%d)
+      kubectl -n klab create configmap certinfo --from-literal=apiserver_expires=$DATE
+      ```
+    solve_script: |
+      cd "$(mktemp -d)"
+      openssl genrsa -out anna.key 2048 2>/dev/null
+      openssl req -new -key anna.key -out anna.csr -subj "/CN=dev-anna/O=developers" 2>/dev/null
+      cat <<YAML | kubectl apply -f -
+      apiVersion: certificates.k8s.io/v1
+      kind: CertificateSigningRequest
+      metadata:
+        name: dev-anna
+      spec:
+        request: $(cat anna.csr | base64 | tr -d '\n')
+        signerName: kubernetes.io/kube-apiserver-client
+        expirationSeconds: 86400
+        usages:
+          - client auth
+      YAML
+      kubectl certificate approve dev-anna
+      sleep 5
+      NODE=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+      END=$(docker exec $NODE openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -enddate | cut -d= -f2)
+      DATE=$(docker exec $NODE date -u -d "$END" +%Y-%m-%d)
+      kubectl -n klab create configmap certinfo --from-literal=apiserver_expires=$DATE
+
+  - id: adm-kubeconfig
+    title: Build a kubeconfig by hand - clusters, users and contexts
+    difficulty: medium
+    exams: [CKA]
+    concepts: [kubeconfig, contexts, users, clusters, kubectl config]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Three lists and a pointer. Once you see the shape it stops being scary.
+    scenario: |
+      A kubeconfig is three independent lists - `clusters`, `users`,
+      `contexts` - plus a `current-context` pointer. A context is nothing
+      more than "this user, against this cluster, defaulting to this
+      namespace".
+
+      Build one from scratch for the `dev-anna` identity, without touching
+      your working kubeconfig.
+    docs:
+      - https://kubernetes.io/docs/tasks/access-application-cluster/configure-access-multiple-clusters/
+      - https://kubernetes.io/docs/reference/generated/kubectl/kubectl-commands#config
+    tasks:
+      - text: "Create a kubeconfig file at `/tmp/klab/anna.kubeconfig`."
+      - text: "It must define a cluster named `kubestronaut` with the real API server URL and CA data from your current config."
+      - text: "It must define a user named `dev-anna`."
+      - text: "It must define a context named `anna@kubestronaut` binding that user to that cluster with default namespace `dev`, and set it as current-context."
+      - text: "Record the context name in a ConfigMap `kubeconfiginfo` in `klab`, key `context`."
+    setup:
+      - kind: shell
+        desc: prepare directories
+        run: |
+          kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create ns dev --dry-run=client -o yaml | kubectl apply -f -
+          rm -rf /tmp/klab && mkdir -p /tmp/klab
+    verify:
+      - id: file
+        desc: /tmp/klab/anna.kubeconfig exists and is valid YAML kubectl can read
+        points: 25
+        hint: "KUBECONFIG=/tmp/klab/anna.kubeconfig kubectl config view"
+        run: |
+          [ -f /tmp/klab/anna.kubeconfig ] || exit 1
+          KUBECONFIG=/tmp/klab/anna.kubeconfig kubectl config view >/dev/null 2>&1
+      - id: cluster
+        desc: It defines a cluster named kubestronaut pointing at the real API server
+        points: 25
+        hint: "kubectl config set-cluster kubestronaut --server=... --certificate-authority=... --embed-certs"
+        run: |
+          want=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          got=$(KUBECONFIG=/tmp/klab/anna.kubeconfig kubectl config view -o jsonpath='{.clusters[?(@.name=="kubestronaut")].cluster.server}')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: user
+        desc: It defines a user named dev-anna
+        points: 20
+        hint: "kubectl config set-credentials dev-anna --client-certificate=... --client-key=..."
+        run: |
+          KUBECONFIG=/tmp/klab/anna.kubeconfig kubectl config view \
+            -o jsonpath='{.users[*].name}' | grep -q 'dev-anna'
+      - id: context
+        desc: The context anna@kubestronaut exists, defaults to dev, and is current
+        points: 30
+        hint: "kubectl config set-context anna@kubestronaut --cluster=... --user=... --namespace=dev"
+        run: |
+          export KUBECONFIG=/tmp/klab/anna.kubeconfig
+          eq "$(kubectl config current-context)" "anna@kubestronaut" || exit 1
+          eq "$(kubectl config view -o jsonpath='{.contexts[?(@.name=="anna@kubestronaut")].context.namespace}')" "dev" || exit 1
+          eq "$(kubectl config view -o jsonpath='{.contexts[?(@.name=="anna@kubestronaut")].context.user}')" "dev-anna" || exit 1
+          eq "$(kubectl config view -o jsonpath='{.contexts[?(@.name=="anna@kubestronaut")].context.cluster}')" "kubestronaut"
+      - id: recorded
+        desc: The context name is recorded in the ConfigMap
+        points: 0
+        hint: "kubectl -n klab create configmap kubeconfiginfo --from-literal=context=anna@kubestronaut"
+        run: |
+          eq "$(jp cm kubeconfiginfo '{.data.context}' -n klab | tr -d ' ')" "anna@kubestronaut"
+    hints:
+      - title: Point KUBECONFIG at the new file first
+        cost: 8
+        text: |
+          Every `kubectl config` subcommand writes to whatever `$KUBECONFIG`
+          points at, so set it once and you cannot damage your real config:
+
+          ```
+          export KUBECONFIG=/tmp/klab/anna.kubeconfig
+          ```
+          Unset it again when you are finished.
+      - title: The three set-* commands
+        cost: 12
+        text: |
+          ```
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+
+          kubectl config set-cluster kubestronaut \
+            --server="$SERVER" --insecure-skip-tls-verify=true
+
+          kubectl config set-credentials dev-anna \
+            --client-certificate=anna.crt --client-key=anna.key --embed-certs=true
+
+          kubectl config set-context anna@kubestronaut \
+            --cluster=kubestronaut --user=dev-anna --namespace=dev
+
+          kubectl config use-context anna@kubestronaut
+          ```
+      - title: Getting the CA properly
+        cost: 10
+        text: |
+          Rather than skipping TLS verification, embed the real CA:
+
+          ```
+          kubectl config view --raw --minify \
+            -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+            | base64 -d > /tmp/klab/ca.crt
+
+          kubectl config set-cluster kubestronaut \
+            --server="$SERVER" --certificate-authority=/tmp/klab/ca.crt --embed-certs=true
+          ```
+    solution: |
+      ```bash
+      mkdir -p /tmp/klab
+      SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+      kubectl config view --raw --minify \
+        -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > /tmp/klab/ca.crt
+
+      export KUBECONFIG=/tmp/klab/anna.kubeconfig
+
+      kubectl config set-cluster kubestronaut \
+        --server="$SERVER" --certificate-authority=/tmp/klab/ca.crt --embed-certs=true
+      kubectl config set-credentials dev-anna --username=dev-anna
+      kubectl config set-context anna@kubestronaut \
+        --cluster=kubestronaut --user=dev-anna --namespace=dev
+      kubectl config use-context anna@kubestronaut
+
+      unset KUBECONFIG
+      kubectl -n klab create configmap kubeconfiginfo --from-literal=context=anna@kubestronaut
+      ```
+    solve_script: |
+      mkdir -p /tmp/klab
+      SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+      kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > /tmp/klab/ca.crt
+      REAL="$KUBECONFIG"
+      export KUBECONFIG=/tmp/klab/anna.kubeconfig
+      kubectl config set-cluster kubestronaut --server="$SERVER" --certificate-authority=/tmp/klab/ca.crt --embed-certs=true
+      kubectl config set-credentials dev-anna --username=dev-anna
+      kubectl config set-context anna@kubestronaut --cluster=kubestronaut --user=dev-anna --namespace=dev
+      kubectl config use-context anna@kubestronaut
+      export KUBECONFIG="$REAL"
+      kubectl -n klab create configmap kubeconfiginfo --from-literal=context=anna@kubestronaut
+
+  - id: adm-upgrade-plan
+    title: Plan a control plane upgrade with kubeadm
+    difficulty: hard
+    exams: [CKA]
+    concepts: [kubeadm, upgrades, versions, skew policy]
+    par_minutes: 15
+    estimated_minutes: 20
+    blurb: The exact command order for a cluster upgrade, and the skew rules behind it.
+    scenario: |
+      Cluster upgrades are a guaranteed CKA topic. The order is fixed and
+      unforgiving:
+
+      1. control plane node: `kubeadm upgrade plan`, then
+         `kubeadm upgrade apply vX.Y.Z`
+      2. drain the node, upgrade the `kubelet` and `kubectl` packages,
+         restart the kubelet, uncordon
+      3. each worker in turn: `kubeadm upgrade node`, drain, upgrade
+         kubelet, restart, uncordon
+
+      The version skew policy is what makes the order matter: the kubelet
+      may be up to three minor versions *behind* the API server, never ahead.
+
+      Investigate this cluster and write the facts down.
+    docs:
+      - https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/
+      - https://kubernetes.io/releases/version-skew-policy/
+    tasks:
+      - text: "Run `kubeadm upgrade plan` on the control plane node and read the output."
+      - text: "Record in ConfigMap `upgradeinfo` in `klab`: key `current` = the cluster's current Kubernetes version (as reported by kubeadm, e.g. v1.34.0)."
+      - text: "Key `first_command` = the kubeadm subcommand you run on the control plane to perform the upgrade (two words, e.g. `upgrade apply`)."
+      - text: "Key `worker_command` = the kubeadm subcommand you run on each worker (two words)."
+      - text: "Key `skew` = how many minor versions the kubelet may lag behind the API server (a number)."
+    setup:
+      - kind: shell
+        desc: prepare the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: current
+        desc: The recorded current version matches the real control plane version
+        points: 30
+        hint: "kubectl version, or docker exec <node> kubeadm version -o short"
+        run: |
+          want=$(kubectl get nodes -l node-role.kubernetes.io/control-plane \
+            -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}')
+          got=$(jp cm upgradeinfo '{.data.current}' -n klab | tr -d ' ')
+          [ -n "$want" ] || exit 1
+          eq "${got%%+*}" "${want%%+*}"
+      - id: first-command
+        desc: The control plane upgrade command is recorded correctly
+        points: 25
+        hint: "on the first control plane node it is: kubeadm upgrade apply <version>"
+        run: |
+          got=$(jp cm upgradeinfo '{.data.first_command}' -n klab | tr -d ' ' | tr 'A-Z' 'a-z')
+          eq "$got" "upgradeapply"
+      - id: worker-command
+        desc: The worker upgrade command is recorded correctly
+        points: 25
+        hint: "on workers (and additional control plane nodes) it is: kubeadm upgrade node"
+        run: |
+          got=$(jp cm upgradeinfo '{.data.worker_command}' -n klab | tr -d ' ' | tr 'A-Z' 'a-z')
+          eq "$got" "upgradenode"
+      - id: skew
+        desc: The kubelet version skew allowance is recorded correctly
+        points: 20
+        hint: "kubernetes.io/releases/version-skew-policy -- the kubelet may be N minor versions older"
+        run: |
+          eq "$(jp cm upgradeinfo '{.data.skew}' -n klab | tr -d ' ')" "3"
+    hints:
+      - title: Running the plan
+        cost: 10
+        text: |
+          ```
+          knode kubestronaut-control-plane kubeadm upgrade plan
+          ```
+          It prints the current version, the components it would upgrade,
+          and the exact `kubeadm upgrade apply` command to run.
+      - title: The full real-world sequence
+        cost: 12
+        text: |
+          On the control plane:
+          ```
+          apt-get install -y kubeadm=1.34.1-*
+          kubeadm upgrade plan
+          kubeadm upgrade apply v1.34.1
+          kubectl drain <cp> --ignore-daemonsets
+          apt-get install -y kubelet=1.34.1-* kubectl=1.34.1-*
+          systemctl daemon-reload && systemctl restart kubelet
+          kubectl uncordon <cp>
+          ```
+          On each worker, identical except `kubeadm upgrade node` instead of
+          `upgrade apply`.
+      - title: The skew rules worth memorising
+        cost: 10
+        text: |
+          - kubelet: up to **3** minor versions older than kube-apiserver, never newer
+          - kube-proxy: same rule as the kubelet
+          - kubectl: within one minor version either side of the API server
+          - controller-manager and scheduler: one minor older, never newer
+    solution: |
+      ```bash
+      knode kubestronaut-control-plane kubeadm upgrade plan
+
+      VER=$(kubectl get nodes -l node-role.kubernetes.io/control-plane \
+        -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}')
+
+      kubectl -n klab create configmap upgradeinfo \
+        --from-literal=current=$VER \
+        --from-literal=first_command="upgrade apply" \
+        --from-literal=worker_command="upgrade node" \
+        --from-literal=skew=3
+      ```
+    solve_script: |
+      VER=$(kubectl get nodes -l node-role.kubernetes.io/control-plane \
+        -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}')
+      kubectl -n klab create configmap upgradeinfo \
+        --from-literal=current=$VER \
+        --from-literal=first_command="upgrade apply" \
+        --from-literal=worker_command="upgrade node" \
+        --from-literal=skew=3
+
+  - id: adm-kubelet-config
+    title: Read the kubelet's configuration and its node registration
+    difficulty: medium
+    exams: [CKA]
+    concepts: [kubelet, node registration, systemd, kubelet config]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Where the kubelet gets its settings, and how a node joins a cluster.
+    scenario: |
+      Almost every "node NotReady" incident ends up at the kubelet, so know
+      where its configuration lives:
+
+      - `/var/lib/kubelet/config.yaml` - the KubeletConfiguration object
+      - `/etc/kubernetes/kubelet.conf` - the kubeconfig it uses to talk to
+        the API server
+      - `/var/lib/kubelet/kubeadm-flags.env` - extra command-line flags
+      - `systemctl status kubelet` and `journalctl -u kubelet` - what it is
+        actually doing
+
+      Dig them out on this cluster and record the answers.
+    docs:
+      - https://kubernetes.io/docs/tasks/administer-cluster/kubelet-config-file/
+      - https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/
+    tasks:
+      - text: "Record in ConfigMap `kubeletinfo` in `klab`: key `config` = the path of the kubelet's config file."
+      - text: "Key `kubeconfig` = the path of the kubeconfig the kubelet uses."
+      - text: "Key `clusterdns` = the clusterDNS IP from the kubelet config."
+      - text: "Key `cgroupdriver` = the cgroupDriver the kubelet is configured with."
+      - text: "Key `unit` = the systemd unit name that runs the kubelet."
+    setup:
+      - kind: shell
+        desc: prepare the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: paths
+        desc: The config and kubeconfig paths are correct
+        points: 30
+        hint: "knode <node> ls /var/lib/kubelet/ and /etc/kubernetes/"
+        run: |
+          eq "$(jp cm kubeletinfo '{.data.config}' -n klab | tr -d ' ')" "/var/lib/kubelet/config.yaml" || exit 1
+          eq "$(jp cm kubeletinfo '{.data.kubeconfig}' -n klab | tr -d ' ')" "/etc/kubernetes/kubelet.conf"
+      - id: clusterdns
+        desc: The recorded clusterDNS matches the kubelet's real configuration
+        points: 25
+        hint: "knode <node> grep -A2 clusterDNS /var/lib/kubelet/config.yaml"
+        run: |
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          want=$(docker exec "$node" sh -c \
+            "grep -A2 '^clusterDNS' /var/lib/kubelet/config.yaml | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1")
+          got=$(jp cm kubeletinfo '{.data.clusterdns}' -n klab | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: cgroup
+        desc: The recorded cgroupDriver matches the kubelet's real configuration
+        points: 25
+        hint: "knode <node> grep cgroupDriver /var/lib/kubelet/config.yaml"
+        run: |
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          want=$(docker exec "$node" sh -c \
+            "grep '^cgroupDriver' /var/lib/kubelet/config.yaml | awk '{print \$2}'")
+          got=$(jp cm kubeletinfo '{.data.cgroupdriver}' -n klab | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: unit
+        desc: The systemd unit name is recorded
+        points: 20
+        hint: "systemctl status kubelet"
+        run: |
+          jp cm kubeletinfo '{.data.unit}' -n klab | grep -q 'kubelet'
+    hints:
+      - title: Getting onto a node
+        cost: 6
+        text: |
+          ```
+          knode                                    # list nodes
+          knode kubestronaut-control-plane         # shell in
+          ```
+          Then read the files directly.
+      - title: The commands
+        cost: 10
+        text: |
+          ```
+          cat /var/lib/kubelet/config.yaml
+          cat /var/lib/kubelet/kubeadm-flags.env
+          systemctl status kubelet
+          journalctl -u kubelet -n 50 --no-pager
+          ```
+      - title: Why cgroupDriver matters
+        cost: 10
+        text: |
+          The kubelet and the container runtime must agree on the cgroup
+          driver (`systemd` or `cgroupfs`). If they disagree, pods fail to
+          start with cgroup errors and the node flaps NotReady. It is one of
+          the classic kubeadm install failures.
+    solution: |
+      ```bash
+      NODE=kubestronaut-control-plane
+      docker exec $NODE cat /var/lib/kubelet/config.yaml | grep -E 'clusterDNS|cgroupDriver' -A2
+
+      DNS=$(docker exec $NODE sh -c "grep -A2 '^clusterDNS' /var/lib/kubelet/config.yaml \
+        | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1")
+      CG=$(docker exec $NODE sh -c "grep '^cgroupDriver' /var/lib/kubelet/config.yaml | awk '{print \$2}'")
+
+      kubectl -n klab create configmap kubeletinfo \
+        --from-literal=config=/var/lib/kubelet/config.yaml \
+        --from-literal=kubeconfig=/etc/kubernetes/kubelet.conf \
+        --from-literal=clusterdns=$DNS \
+        --from-literal=cgroupdriver=$CG \
+        --from-literal=unit=kubelet.service
+      ```
+    solve_script: |
+      NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+      DNS=$(docker exec $NODE sh -c "grep -A2 '^clusterDNS' /var/lib/kubelet/config.yaml | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1")
+      CG=$(docker exec $NODE sh -c "grep '^cgroupDriver' /var/lib/kubelet/config.yaml | awk '{print \$2}'")
+      kubectl -n klab create configmap kubeletinfo \
+        --from-literal=config=/var/lib/kubelet/config.yaml \
+        --from-literal=kubeconfig=/etc/kubernetes/kubelet.conf \
+        --from-literal=clusterdns=$DNS \
+        --from-literal=cgroupdriver=$CG \
+        --from-literal=unit=kubelet.service

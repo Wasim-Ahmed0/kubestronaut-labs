@@ -1,0 +1,842 @@
+category: Security Hardening
+labs:
+
+  - id: sec-securitycontext
+    title: securityContext - drop root, drop capabilities, drop write access
+    difficulty: medium
+    exams: [CKS, KCSA, CKAD]
+    concepts: [securityContext, runAsNonRoot, capabilities, readOnlyRootFilesystem, privilege escalation]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: The five fields that turn a default container into a hardened one.
+    scenario: |
+      A container running as root with the default capability set is one
+      escape away from the node. Five fields fix most of that, and they are
+      the backbone of every Kubernetes hardening benchmark:
+
+      - `runAsNonRoot: true` - refuse to start if the image runs as UID 0
+      - `runAsUser` / `runAsGroup` - pin the identity explicitly
+      - `allowPrivilegeEscalation: false` - block setuid binaries from gaining more
+      - `capabilities.drop: ["ALL"]` - start from nothing, add back only what is needed
+      - `readOnlyRootFilesystem: true` - no writing to the image layer
+
+      Harden the `api` Deployment without breaking it.
+    docs:
+      - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+      - https://kubernetes.io/docs/concepts/security/pod-security-standards/
+    tasks:
+      - text: "Set a pod-level securityContext on `hard/api`: runAsNonRoot true, runAsUser 101, runAsGroup 101, fsGroup 101."
+      - text: "Set a container-level securityContext: allowPrivilegeEscalation false, readOnlyRootFilesystem true, capabilities drop ALL."
+      - text: "The image needs writable `/tmp` and `/var/cache/nginx` - provide them as emptyDir volumes so a read-only root still works."
+      - text: "The Deployment must roll out and every pod must be Ready."
+    setup:
+      - kind: shell
+        desc: deploy an unhardened api
+        run: |
+          kubectl create ns hard
+          kubectl -n hard create deployment api --image=nginxinc/nginx-unprivileged:1.27-alpine --replicas=2
+          kubectl -n hard rollout status deploy/api --timeout=240s
+    verify:
+      - id: pod-context
+        desc: The pod securityContext pins a non-root identity
+        points: 25
+        hint: "spec.template.spec.securityContext -- pod level, applies to every container"
+        run: |
+          c='.spec.template.spec.securityContext'
+          eq "$(jp deploy api "{$c.runAsNonRoot}" -n hard)" "true" || exit 1
+          eq "$(jp deploy api "{$c.runAsUser}" -n hard)" "101" || exit 1
+          eq "$(jp deploy api "{$c.runAsGroup}" -n hard)" "101" || exit 1
+          eq "$(jp deploy api "{$c.fsGroup}" -n hard)" "101"
+      - id: container-context
+        desc: The container drops all capabilities and cannot escalate
+        points: 30
+        hint: "spec.template.spec.containers[0].securityContext -- container level"
+        run: |
+          c='.spec.template.spec.containers[0].securityContext'
+          eq "$(jp deploy api "{$c.allowPrivilegeEscalation}" -n hard)" "false" || exit 1
+          eq "$(jp deploy api "{$c.readOnlyRootFilesystem}" -n hard)" "true" || exit 1
+          jp deploy api "{$c.capabilities.drop[*]}" -n hard | grep -q 'ALL'
+      - id: writable-paths
+        desc: Writable emptyDir volumes are mounted for /tmp and the nginx cache
+        points: 20
+        hint: "a read-only root filesystem still needs somewhere to write"
+        run: |
+          m=$(jp deploy api '{.spec.template.spec.containers[0].volumeMounts[*].mountPath}' -n hard)
+          echo "$m" | grep -q '/tmp' && echo "$m" | grep -q '/var/cache/nginx'
+      - id: running
+        desc: The hardened Deployment is fully rolled out
+        points: 25
+        hint: "kubectl -n hard rollout status deploy/api -- if pods crash, check the logs for permission errors"
+        run: |
+          rollout hard deploy/api 240s || exit 1
+          eq "$(jp deploy api '{.status.readyReplicas}' -n hard)" "2"
+      - id: really-nonroot
+        desc: The running process is really UID 101
+        points: 0
+        hint: "kubectl -n hard exec deploy/api -- id"
+        run: |
+          pod=$(kubectl -n hard get pods -l app=api -o name | head -1)
+          kubectl -n hard exec "$pod" -- id -u 2>/dev/null | tr -d '\r' | grep -qx 101
+    hints:
+      - title: Pod level versus container level
+        cost: 10
+        text: |
+          `runAsNonRoot`, `runAsUser`, `runAsGroup`, `fsGroup` and
+          `seccompProfile` go on the **pod**.
+          `allowPrivilegeEscalation`, `readOnlyRootFilesystem`,
+          `capabilities` and `privileged` go on the **container**. A
+          container-level value overrides the pod-level one.
+      - title: Making a read-only root work
+        cost: 12
+        text: |
+          nginx writes to `/tmp` and `/var/cache/nginx`. Give it tmpfs-style
+          scratch space:
+
+          ```yaml
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            - name: cache
+              emptyDir: {}
+          containers:
+            - name: nginx-unprivileged
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+                - {name: cache, mountPath: /var/cache/nginx}
+          ```
+      - title: Find the container name first
+        cost: 6
+        text: |
+          ```
+          kubectl -n hard get deploy api -o jsonpath='{.spec.template.spec.containers[*].name}'
+          ```
+          A strategic merge patch matches containers by name, so getting it
+          wrong silently appends a second container instead of editing yours.
+    solution: |
+      ```bash
+      NAME=$(kubectl -n hard get deploy api -o jsonpath='{.spec.template.spec.containers[0].name}')
+
+      kubectl -n hard patch deploy api --type=strategic -p "
+      spec:
+        template:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 101
+              runAsGroup: 101
+              fsGroup: 101
+            volumes:
+              - name: tmp
+                emptyDir: {}
+              - name: cache
+                emptyDir: {}
+            containers:
+              - name: $NAME
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: [\"ALL\"]
+                volumeMounts:
+                  - {name: tmp, mountPath: /tmp}
+                  - {name: cache, mountPath: /var/cache/nginx}
+      "
+      kubectl -n hard rollout status deploy/api
+      ```
+    solve_script: |
+      NAME=$(kubectl -n hard get deploy api -o jsonpath='{.spec.template.spec.containers[0].name}')
+      kubectl -n hard patch deploy api --type=strategic -p "{\"spec\":{\"template\":{\"spec\":{\"securityContext\":{\"runAsNonRoot\":true,\"runAsUser\":101,\"runAsGroup\":101,\"fsGroup\":101},\"volumes\":[{\"name\":\"tmp\",\"emptyDir\":{}},{\"name\":\"cache\",\"emptyDir\":{}}],\"containers\":[{\"name\":\"$NAME\",\"securityContext\":{\"allowPrivilegeEscalation\":false,\"readOnlyRootFilesystem\":true,\"capabilities\":{\"drop\":[\"ALL\"]}},\"volumeMounts\":[{\"name\":\"tmp\",\"mountPath\":\"/tmp\"},{\"name\":\"cache\",\"mountPath\":\"/var/cache/nginx\"}]}]}}}}"
+      kubectl -n hard rollout status deploy/api --timeout=300s
+
+  - id: sec-pod-security-admission
+    title: Pod Security Admission - enforce the restricted standard
+    difficulty: hard
+    exams: [CKS, KCSA, CKA]
+    concepts: [pod security admission, pod security standards, restricted, baseline, admission control]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: PodSecurityPolicy is gone. This is what replaced it, and it is just labels.
+    scenario: |
+      PodSecurityPolicy was removed in 1.25. Pod Security Admission took
+      over, and it is refreshingly simple: you put labels on a namespace and
+      the API server enforces one of three built-in profiles.
+
+      - `privileged` - no restrictions
+      - `baseline` - blocks the well-known escapes (privileged, hostPID,
+        hostNetwork, most hostPath)
+      - `restricted` - baseline plus non-root, seccomp, dropped capabilities
+
+      Three modes: `enforce` (reject), `audit` (log), `warn` (tell the user).
+      Running `warn` and `audit` at `restricted` while only enforcing
+      `baseline` is the standard migration path.
+    docs:
+      - https://kubernetes.io/docs/concepts/security/pod-security-admission/
+      - https://kubernetes.io/docs/concepts/security/pod-security-standards/
+    tasks:
+      - text: "Label namespace `psa-prod` to enforce the `restricted` standard at version `latest`."
+      - text: "Label namespace `psa-dev` to enforce `baseline`, but warn and audit at `restricted`."
+      - text: "Deploy a compliant Pod `good` into `psa-prod` (`nginxinc/nginx-unprivileged:1.27-alpine`) that satisfies restricted."
+      - text: "Prove enforcement works: a privileged pod must be rejected by `psa-prod`. Record the outcome in ConfigMap `psainfo` in `psa-prod`, key `privileged_rejected` = `true`."
+    setup:
+      - kind: shell
+        desc: create two unlabelled namespaces
+        run: |
+          kubectl create ns psa-prod
+          kubectl create ns psa-dev
+    verify:
+      - id: prod-labels
+        desc: psa-prod enforces restricted
+        points: 25
+        hint: "kubectl label ns psa-prod pod-security.kubernetes.io/enforce=restricted"
+        run: |
+          eq "$(jp ns psa-prod '{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" "restricted" || exit 1
+          eq "$(jp ns psa-prod '{.metadata.labels.pod-security\.kubernetes\.io/enforce-version}')" "latest"
+      - id: dev-labels
+        desc: psa-dev enforces baseline but warns and audits at restricted
+        points: 25
+        hint: "three separate labels: enforce, warn and audit"
+        run: |
+          eq "$(jp ns psa-dev '{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" "baseline" || exit 1
+          eq "$(jp ns psa-dev '{.metadata.labels.pod-security\.kubernetes\.io/warn}')" "restricted" || exit 1
+          eq "$(jp ns psa-dev '{.metadata.labels.pod-security\.kubernetes\.io/audit}')" "restricted"
+      - id: good-pod
+        desc: A restricted-compliant pod named good is Running in psa-prod
+        points: 30
+        hint: "restricted needs runAsNonRoot, seccompProfile RuntimeDefault, drop ALL caps, no privilege escalation"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n psa-prod get pod good -o jsonpath="{.status.phase}")" = "Running" ]'
+      - id: enforcement-real
+        desc: The restricted profile really rejects a privileged pod
+        points: 20
+        hint: "try to create one and watch the API server refuse it"
+        run: |
+          out=$(kubectl -n psa-prod run klab-privtest --image=busybox:1.36 --restart=Never \
+                  --overrides='{"spec":{"containers":[{"name":"c","image":"busybox:1.36","securityContext":{"privileged":true}}]}}' \
+                  --dry-run=server 2>&1 || true)
+          echo "$out" | grep -qi 'violate' || exit 1
+          eq "$(jp cm psainfo '{.data.privileged_rejected}' -n psa-prod | tr -d ' ')" "true"
+    hints:
+      - title: The label format
+        cost: 8
+        text: |
+          ```
+          kubectl label ns psa-prod \
+            pod-security.kubernetes.io/enforce=restricted \
+            pod-security.kubernetes.io/enforce-version=latest
+
+          kubectl label ns psa-dev \
+            pod-security.kubernetes.io/enforce=baseline \
+            pod-security.kubernetes.io/warn=restricted \
+            pod-security.kubernetes.io/audit=restricted
+          ```
+      - title: What restricted actually demands
+        cost: 12
+        text: |
+          A pod that passes `restricted` needs all of:
+
+          ```yaml
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: c
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: ["ALL"]
+          ```
+          Miss any one and the API server rejects the pod with a message
+          naming the exact violation.
+      - title: Testing without creating anything
+        cost: 10
+        text: |
+          ```
+          kubectl -n psa-prod run test --image=busybox --dry-run=server \
+            --overrides='{"spec":{"containers":[{"name":"c","image":"busybox",
+              "securityContext":{"privileged":true}}]}}'
+          ```
+          `--dry-run=server` runs the full admission chain without
+          persisting anything - ideal for probing policy.
+    solution: |
+      ```bash
+      kubectl label ns psa-prod \
+        pod-security.kubernetes.io/enforce=restricted \
+        pod-security.kubernetes.io/enforce-version=latest
+
+      kubectl label ns psa-dev \
+        pod-security.kubernetes.io/enforce=baseline \
+        pod-security.kubernetes.io/warn=restricted \
+        pod-security.kubernetes.io/audit=restricted
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: good, namespace: psa-prod}
+      spec:
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 101
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+          - name: c
+            image: nginxinc/nginx-unprivileged:1.27-alpine
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities: {drop: ["ALL"]}
+      YAML
+
+      kubectl -n psa-prod create configmap psainfo --from-literal=privileged_rejected=true
+      ```
+    solve_script: |
+      kubectl label ns psa-prod pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest --overwrite
+      kubectl label ns psa-dev pod-security.kubernetes.io/enforce=baseline pod-security.kubernetes.io/warn=restricted pod-security.kubernetes.io/audit=restricted --overwrite
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: good, namespace: psa-prod}
+      spec:
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 101
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+          - name: c
+            image: nginxinc/nginx-unprivileged:1.27-alpine
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities: {drop: ["ALL"]}
+      YAML
+      kubectl -n psa-prod wait --for=condition=Ready pod/good --timeout=240s
+      kubectl -n psa-prod create configmap psainfo --from-literal=privileged_rejected=true
+
+  - id: sec-find-privileged
+    title: Hunt down the escape hatches in a running cluster
+    difficulty: hard
+    exams: [CKS, KCSA]
+    concepts: [privileged containers, hostPID, hostNetwork, hostPath, audit]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: Five workloads, four of them dangerous. Find them and neutralise them.
+    scenario: |
+      A CKS question you will meet in some form: "find every pod in this
+      namespace that violates policy, and fix or delete it".
+
+      The escape hatches to look for:
+
+      - `privileged: true` - effectively root on the node
+      - `hostPID: true` - can see and signal every process on the node
+      - `hostNetwork: true` - shares the node's network stack
+      - `hostPath` mounts of sensitive directories - `/`, `/var/run/docker.sock`, `/etc`
+      - `capabilities.add: ["SYS_ADMIN"]` - most of privileged, quietly
+
+      The `risky` namespace has five Deployments. One is fine. Deal with the
+      other four.
+    docs:
+      - https://kubernetes.io/docs/concepts/security/pod-security-standards/
+    tasks:
+      - text: "Delete every Deployment in `risky` that runs a privileged container, uses hostPID, uses hostNetwork, or mounts the host root filesystem."
+      - text: "Leave the compliant Deployment running."
+      - text: "Label the `risky` namespace to enforce the `baseline` Pod Security standard so it cannot happen again."
+      - text: "Record how many Deployments you removed in ConfigMap `huntinfo` in `risky`, key `removed`."
+    setup:
+      - kind: shell
+        desc: deploy four dangerous workloads and one good one
+        run: |
+          kubectl create ns risky
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: priv-app, namespace: risky}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: priv-app}}
+            template:
+              metadata: {labels: {app: priv-app}}
+              spec:
+                containers:
+                  - name: c
+                    image: registry.k8s.io/pause:3.9
+                    securityContext: {privileged: true}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: hostpid-app, namespace: risky}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: hostpid-app}}
+            template:
+              metadata: {labels: {app: hostpid-app}}
+              spec:
+                hostPID: true
+                containers:
+                  - name: c
+                    image: registry.k8s.io/pause:3.9
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: hostnet-app, namespace: risky}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: hostnet-app}}
+            template:
+              metadata: {labels: {app: hostnet-app}}
+              spec:
+                hostNetwork: true
+                containers:
+                  - name: c
+                    image: registry.k8s.io/pause:3.9
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: hostroot-app, namespace: risky}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: hostroot-app}}
+            template:
+              metadata: {labels: {app: hostroot-app}}
+              spec:
+                volumes:
+                  - name: hostroot
+                    hostPath: {path: /}
+                containers:
+                  - name: c
+                    image: registry.k8s.io/pause:3.9
+                    volumeMounts: [{name: hostroot, mountPath: /host}]
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: good-app, namespace: risky}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: good-app}}
+            template:
+              metadata: {labels: {app: good-app}}
+              spec:
+                containers:
+                  - name: c
+                    image: registry.k8s.io/pause:3.9
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities: {drop: ["ALL"]}
+          YAML
+          kubectl -n risky rollout status deploy/good-app --timeout=240s
+    verify:
+      - id: privileged-gone
+        desc: No privileged container remains in risky
+        points: 25
+        hint: "kubectl -n risky get deploy -o jsonpath to find securityContext.privileged"
+        run: |
+          ! kubectl -n risky get deploy -o jsonpath='{range .items[*]}{.spec.template.spec.containers[*].securityContext.privileged}{"\n"}{end}' \
+            | grep -q true
+      - id: host-namespaces-gone
+        desc: No workload uses hostPID or hostNetwork
+        points: 25
+        hint: "hostPID and hostNetwork are pod-spec booleans"
+        run: |
+          ! kubectl -n risky get deploy -o jsonpath='{range .items[*]}{.spec.template.spec.hostPID} {.spec.template.spec.hostNetwork}{"\n"}{end}' \
+            | grep -q true
+      - id: hostpath-gone
+        desc: Nothing mounts the host root filesystem
+        points: 25
+        hint: "look at spec.template.spec.volumes[*].hostPath.path"
+        run: |
+          ! kubectl -n risky get deploy -o jsonpath='{range .items[*]}{.spec.template.spec.volumes[*].hostPath.path}{"\n"}{end}' \
+            | grep -qx '/'
+      - id: good-survives
+        desc: The compliant Deployment is still running
+        points: 15
+        hint: "good-app has nothing wrong with it -- do not delete it"
+        run: |
+          has deploy good-app -n risky || exit 1
+          rollout risky deploy/good-app 120s
+      - id: namespace-locked
+        desc: The risky namespace now enforces the baseline standard
+        points: 10
+        hint: "kubectl label ns risky pod-security.kubernetes.io/enforce=baseline"
+        run: |
+          jp ns risky '{.metadata.labels.pod-security\.kubernetes\.io/enforce}' | grep -Eq 'baseline|restricted'
+      - id: counted
+        desc: You recorded how many Deployments you removed
+        points: 0
+        hint: "four of the five were dangerous"
+        run: |
+          eq "$(jp cm huntinfo '{.data.removed}' -n risky | tr -d ' ')" "4"
+    hints:
+      - title: One query to find them all
+        cost: 12
+        text: |
+          ```
+          kubectl -n risky get deploy -o custom-columns=\
+          NAME:.metadata.name,\
+          PRIV:.spec.template.spec.containers[*].securityContext.privileged,\
+          HOSTPID:.spec.template.spec.hostPID,\
+          HOSTNET:.spec.template.spec.hostNetwork,\
+          HOSTPATH:.spec.template.spec.volumes[*].hostPath.path
+          ```
+          One table, every violation visible.
+      - title: Deleting them
+        cost: 8
+        text: |
+          ```
+          kubectl -n risky delete deploy priv-app hostpid-app hostnet-app hostroot-app
+          ```
+      - title: Preventing a repeat
+        cost: 8
+        text: |
+          ```
+          kubectl label ns risky pod-security.kubernetes.io/enforce=baseline
+          ```
+          Baseline blocks privileged, hostPID, hostNetwork and most hostPath
+          mounts at admission time, so the next attempt is rejected rather
+          than found later.
+    solution: |
+      ```bash
+      kubectl -n risky get deploy -o custom-columns=\
+      NAME:.metadata.name,\
+      PRIV:.spec.template.spec.containers[*].securityContext.privileged,\
+      HOSTPID:.spec.template.spec.hostPID,\
+      HOSTNET:.spec.template.spec.hostNetwork,\
+      HOSTPATH:.spec.template.spec.volumes[*].hostPath.path
+
+      kubectl -n risky delete deploy priv-app hostpid-app hostnet-app hostroot-app
+
+      kubectl label ns risky pod-security.kubernetes.io/enforce=baseline
+      kubectl -n risky create configmap huntinfo --from-literal=removed=4
+      ```
+    solve_script: |
+      kubectl -n risky delete deploy priv-app hostpid-app hostnet-app hostroot-app --wait=true
+      kubectl label ns risky pod-security.kubernetes.io/enforce=baseline --overwrite
+      kubectl -n risky create configmap huntinfo --from-literal=removed=4
+
+  - id: sec-capabilities
+    title: Linux capabilities - add only what the process truly needs
+    difficulty: hard
+    exams: [CKS]
+    concepts: [capabilities, NET_BIND_SERVICE, privileged, least privilege]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Instead of running as root to bind port 80, grant one capability.
+    scenario: |
+      "It needs root to bind port 80" is almost always wrong. Binding a
+      privileged port needs exactly one capability -
+      `NET_BIND_SERVICE` - not all forty of them.
+
+      Build a pod that drops everything and adds back only that one, and a
+      second pod that proves you can inspect what a container actually has.
+    docs:
+      - https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-capabilities-for-a-container
+      - https://man7.org/linux/man-pages/man7/capabilities.7.html
+    tasks:
+      - text: "In namespace `caps`, create a Pod `binder` (`nginx:1.27-alpine`) that drops ALL capabilities and adds only `NET_BIND_SERVICE`."
+      - text: "It must also set `allowPrivilegeEscalation: false`."
+      - text: "The pod must be Running and serving on port 80."
+      - text: "Record in ConfigMap `capinfo` in `caps` the capability needed to bind a port below 1024, under key `port_capability` (name only, no CAP_ prefix)."
+    setup:
+      - kind: shell
+        desc: create the caps namespace
+        run: kubectl create ns caps
+    verify:
+      - id: dropped
+        desc: The container drops ALL capabilities
+        points: 30
+        hint: "capabilities: {drop: [ALL], add: [NET_BIND_SERVICE]}"
+        run: |
+          jp pod binder '{.spec.containers[0].securityContext.capabilities.drop[*]}' -n caps | grep -q 'ALL'
+      - id: added
+        desc: Only NET_BIND_SERVICE is added back
+        points: 30
+        hint: "one entry in the add list, written without the CAP_ prefix"
+        run: |
+          add=$(jp pod binder '{.spec.containers[0].securityContext.capabilities.add[*]}' -n caps)
+          eq "$add" "NET_BIND_SERVICE"
+      - id: no-escalation
+        desc: allowPrivilegeEscalation is false
+        points: 15
+        hint: "a sibling of capabilities in the container securityContext"
+        run: |
+          eq "$(jp pod binder '{.spec.containers[0].securityContext.allowPrivilegeEscalation}' -n caps)" "false"
+      - id: serving
+        desc: The pod is Running and answers on port 80
+        points: 15
+        hint: "if it crashes, nginx could not bind -- check the capability spelling"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n caps get pod binder -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          RETRY=10 retry kubectl -n caps exec binder -- wget -q -O /dev/null http://127.0.0.1:80
+      - id: recorded
+        desc: You recorded the right capability name
+        points: 10
+        hint: "it is the one that lets a non-root process bind low ports"
+        run: |
+          got=$(jp cm capinfo '{.data.port_capability}' -n caps | tr -d ' ' | tr 'a-z' 'A-Z' | sed 's/^CAP_//')
+          eq "$got" "NET_BIND_SERVICE"
+    hints:
+      - title: The syntax
+        cost: 10
+        text: |
+          ```yaml
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
+          ```
+          Kubernetes wants the name **without** the `CAP_` prefix -
+          `NET_BIND_SERVICE`, not `CAP_NET_BIND_SERVICE`.
+      - title: Inspecting what a container has
+        cost: 10
+        text: |
+          ```
+          kubectl -n caps exec binder -- grep Cap /proc/1/status
+          ```
+          `CapEff` is the effective set as a hex bitmask. On a machine with
+          `capsh` you can decode it with `capsh --decode=<value>`.
+      - title: The capabilities worth knowing for CKS
+        cost: 12
+        text: |
+          - `NET_BIND_SERVICE` - bind ports below 1024
+          - `NET_ADMIN` - configure networking (very powerful)
+          - `SYS_ADMIN` - close to root; treat it as privileged
+          - `SYS_TIME` - set the system clock
+          - `CHOWN`, `SETUID`, `SETGID` - in the default set, usually droppable
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: binder, namespace: caps}
+      spec:
+        containers:
+          - name: nginx
+            image: nginx:1.27-alpine
+            ports: [{containerPort: 80}]
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+                add: ["NET_BIND_SERVICE"]
+      YAML
+
+      kubectl -n caps create configmap capinfo --from-literal=port_capability=NET_BIND_SERVICE
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: binder, namespace: caps}
+      spec:
+        containers:
+          - name: nginx
+            image: nginx:1.27-alpine
+            ports: [{containerPort: 80}]
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+                add: ["NET_BIND_SERVICE"]
+      YAML
+      kubectl -n caps wait --for=condition=Ready pod/binder --timeout=240s
+      kubectl -n caps create configmap capinfo --from-literal=port_capability=NET_BIND_SERVICE
+
+  - id: sec-secrets-hygiene
+    title: Secrets hygiene - stop leaking credentials through the API
+    difficulty: medium
+    exams: [CKS, KCSA]
+    concepts: [secrets, rbac, least privilege, environment variables, mounts]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: Who can read your Secrets, and how they leak even when RBAC is right.
+    scenario: |
+      Three separate hygiene problems in the `creds` namespace:
+
+      1. A Role grants `get` on **all** Secrets to a workload that needs one
+      2. A pod injects a secret as an environment variable, which shows up
+         in `kubectl describe pod`, in crash dumps and in `/proc/1/environ`
+      3. The default ServiceAccount is mounted into a pod that never calls
+         the API
+
+      Fix all three. Mounting a Secret as a file and naming the specific
+      Secret in the Role are the two habits that matter most.
+    docs:
+      - https://kubernetes.io/docs/concepts/configuration/secret/#information-security-for-secrets
+      - https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources
+    tasks:
+      - text: "Restrict Role `creds/secret-reader` so it can only get the Secret named `db-password` (use `resourceNames`), not every Secret."
+      - text: "Recreate Pod `creds/app` so the secret arrives as a file under `/etc/secret` instead of as an environment variable."
+      - text: "That pod must not mount a ServiceAccount token."
+      - text: "The pod must be Running and able to read the password from the file."
+    setup:
+      - kind: shell
+        desc: create a leaky setup
+        run: |
+          kubectl create ns creds
+          kubectl -n creds create secret generic db-password --from-literal=password=hunter2
+          kubectl -n creds create serviceaccount app-sa
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata: {name: secret-reader, namespace: creds}
+          rules:
+            - apiGroups: [""]
+              resources: ["secrets"]
+              verbs: ["get", "list"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata: {name: secret-reader, namespace: creds}
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: secret-reader
+          subjects:
+            - kind: ServiceAccount
+              name: app-sa
+              namespace: creds
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: app, namespace: creds}
+          spec:
+            serviceAccountName: app-sa
+            containers:
+              - name: c
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                env:
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef: {name: db-password, key: password}
+          YAML
+          kubectl -n creds wait --for=condition=Ready pod/app --timeout=240s
+    verify:
+      - id: scoped-role
+        desc: The Role is limited to the db-password Secret by name
+        points: 30
+        hint: "add resourceNames: [db-password] to the rule, and drop the list verb"
+        run: |
+          jp role secret-reader '{.rules[0].resourceNames[*]}' -n creds | grep -q 'db-password' || exit 1
+          ! jp role secret-reader '{.rules[*].verbs[*]}' -n creds | grep -qw 'list'
+      - id: no-env
+        desc: The pod no longer injects the secret as an environment variable
+        points: 30
+        hint: "kubectl -n creds get pod app -o yaml | grep -A3 secretKeyRef"
+        run: |
+          ! jp pod app '{.spec.containers[0].env[*].valueFrom.secretKeyRef.name}' -n creds | grep -q 'db-password'
+      - id: mounted
+        desc: The secret is mounted as a file under /etc/secret
+        points: 25
+        hint: "volumes: [{name: s, secret: {secretName: db-password}}] mounted read-only"
+        run: |
+          eq "$(jp pod app '{.spec.volumes[0].secret.secretName}' -n creds)" "db-password" || exit 1
+          jp pod app '{.spec.containers[0].volumeMounts[*].mountPath}' -n creds | grep -q '/etc/secret' || exit 1
+          RETRY=25 retry bash -c 'kubectl -n creds exec app -- cat /etc/secret/password 2>/dev/null | grep -q hunter2'
+      - id: no-token
+        desc: No ServiceAccount token is mounted into the pod
+        points: 15
+        hint: "automountServiceAccountToken: false on the pod spec"
+        run: |
+          eq "$(jp pod app '{.spec.automountServiceAccountToken}' -n creds)" "false"
+    hints:
+      - title: Narrowing a Role to one object
+        cost: 10
+        text: |
+          ```yaml
+          rules:
+            - apiGroups: [""]
+              resources: ["secrets"]
+              resourceNames: ["db-password"]
+              verbs: ["get"]
+          ```
+          `resourceNames` cannot be combined with `list` or `watch` - those
+          verbs operate on collections, so naming a single object is
+          meaningless for them. That is why the `list` verb has to go.
+      - title: File instead of env var
+        cost: 10
+        text: |
+          ```yaml
+          spec:
+            automountServiceAccountToken: false
+            volumes:
+              - name: secret
+                secret:
+                  secretName: db-password
+            containers:
+              - name: c
+                volumeMounts:
+                  - name: secret
+                    mountPath: /etc/secret
+                    readOnly: true
+          ```
+          Each key becomes a file, so the password is at
+          `/etc/secret/password`.
+      - title: Why env vars leak
+        cost: 10
+        text: |
+          An environment variable shows up in `kubectl describe pod`, in any
+          crash dump, in `/proc/<pid>/environ` for any process in the
+          container, and is inherited by every child process. A mounted file
+          has none of those problems, and it also updates when the Secret
+          changes.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata: {name: secret-reader, namespace: creds}
+      rules:
+        - apiGroups: [""]
+          resources: ["secrets"]
+          resourceNames: ["db-password"]
+          verbs: ["get"]
+      YAML
+
+      kubectl -n creds delete pod app
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: app, namespace: creds}
+      spec:
+        serviceAccountName: app-sa
+        automountServiceAccountToken: false
+        volumes:
+          - name: secret
+            secret: {secretName: db-password}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts:
+              - {name: secret, mountPath: /etc/secret, readOnly: true}
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata: {name: secret-reader, namespace: creds}
+      rules:
+        - apiGroups: [""]
+          resources: ["secrets"]
+          resourceNames: ["db-password"]
+          verbs: ["get"]
+      YAML
+      kubectl -n creds delete pod app --wait=true
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: app, namespace: creds}
+      spec:
+        serviceAccountName: app-sa
+        automountServiceAccountToken: false
+        volumes:
+          - name: secret
+            secret: {secretName: db-password}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            volumeMounts:
+              - {name: secret, mountPath: /etc/secret, readOnly: true}
+      YAML
+      kubectl -n creds wait --for=condition=Ready pod/app --timeout=240s

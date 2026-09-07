@@ -1,0 +1,1039 @@
+category: Controllers, Rollouts & Scaling
+labs:
+
+  - id: ctrl-rollout-update
+    title: Roll a Deployment forward, then undo it
+    difficulty: easy
+    exams: [CKA, CKAD]
+    concepts: [deployments, rollouts, rollback, revision history]
+    par_minutes: 10
+    estimated_minutes: 13
+    blurb: set image, rollout status, rollout history, rollout undo - the core four.
+    scenario: |
+      The `payments` Deployment is running an old image. You are asked to
+      upgrade it, discover the new version is broken, and get back to where
+      you started - without deleting anything.
+
+      This is the single most common day-two operation on Kubernetes and it
+      shows up on both the CKA and the CKAD.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+    tasks:
+      - text: "Record a change-cause annotation and update `payments` to image `nginx:1.27-alpine`."
+      - text: "Then update it again to the deliberately broken image `nginx:does-not-exist`."
+      - text: "Notice the rollout is stuck, and roll back to the previous revision (`nginx:1.27-alpine`)."
+      - text: "Leave the Deployment healthy with all 3 replicas available, and with at least 3 revisions in its history."
+    setup:
+      - kind: shell
+        desc: deploy payments on an old image
+        run: |
+          kubectl create ns fin
+          kubectl -n fin create deployment payments --image=nginx:1.25-alpine --replicas=3
+          kubectl -n fin rollout status deploy/payments --timeout=150s
+    verify:
+      - id: image
+        desc: payments is back on nginx:1.27-alpine
+        points: 30
+        hint: "kubectl -n fin rollout undo deploy/payments"
+        run: |
+          eq "$(jp deploy payments '{.spec.template.spec.containers[0].image}' -n fin)" "nginx:1.27-alpine"
+      - id: healthy
+        desc: All 3 replicas are available and running the 1.27 image
+        points: 30
+        hint: "kubectl -n fin rollout status deploy/payments"
+        run: |
+          rollout fin deploy/payments 180s || exit 1
+          eq "$(jp deploy payments '{.status.availableReplicas}' -n fin)" "3" || exit 1
+          n=$(kubectl -n fin get pods -l app=payments \
+                -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}' \
+                | grep -c '^nginx:1.27-alpine$')
+          [ "${n:-0}" -eq 3 ]
+      - id: history
+        desc: The rollout history proves you went forward and back (3+ revisions)
+        points: 25
+        hint: "kubectl -n fin rollout history deploy/payments"
+        run: |
+          n=$(kubectl -n fin rollout history deploy/payments | grep -cE '^[0-9]+')
+          [ "${n:-0}" -ge 3 ]
+      - id: broken-attempted
+        desc: One of those revisions really was the broken image
+        points: 15
+        hint: "you have to actually deploy nginx:does-not-exist before rolling back from it"
+        run: |
+          kubectl -n fin get rs -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}' \
+            | grep -q 'does-not-exist'
+      - id: no-broken
+        desc: No pod is left stuck pulling the bad image
+        points: 0
+        hint: "kubectl -n fin get pods -- old ReplicaSets should be scaled to zero"
+        run: |
+          RETRY=20 retry bash -c '
+            ! kubectl -n fin get pods -o jsonpath="{range .items[*]}{.spec.containers[0].image}{\"\n\"}{end}" \
+              | grep -q "does-not-exist"'
+    hints:
+      - title: The four commands
+        cost: 8
+        text: |
+          ```
+          kubectl -n fin set image deploy/payments nginx=nginx:1.27-alpine
+          kubectl -n fin rollout status deploy/payments
+          kubectl -n fin rollout history deploy/payments
+          kubectl -n fin rollout undo deploy/payments
+          ```
+          The container name in `set image` is `nginx` here - check with
+          `kubectl -n fin get deploy payments -o jsonpath='{.spec.template.spec.containers[*].name}'`.
+      - title: A stuck rollout
+        cost: 8
+        text: |
+          `rollout status` on a broken image hangs, because the new pods
+          never become ready. Ctrl-C out of it, then either
+          `kubectl -n fin rollout undo deploy/payments` or
+          `kubectl -n fin rollout undo deploy/payments --to-revision=N`.
+      - title: Recording the change cause
+        cost: 10
+        text: |
+          `--record` is deprecated. Set the annotation yourself:
+
+          ```
+          kubectl -n fin annotate deploy/payments \
+            kubernetes.io/change-cause="upgrade to 1.27" --overwrite
+          ```
+    solution: |
+      ```bash
+      kubectl -n fin set image deploy/payments nginx=nginx:1.27-alpine
+      kubectl -n fin annotate deploy/payments \
+        kubernetes.io/change-cause="upgrade to 1.27" --overwrite
+      kubectl -n fin rollout status deploy/payments
+
+      kubectl -n fin set image deploy/payments nginx=nginx:does-not-exist
+      kubectl -n fin rollout status deploy/payments --timeout=30s   # fails
+
+      kubectl -n fin rollout undo deploy/payments
+      kubectl -n fin rollout status deploy/payments
+      kubectl -n fin rollout history deploy/payments
+      ```
+    solve_script: |
+      kubectl -n fin set image deploy/payments nginx=nginx:1.27-alpine
+      kubectl -n fin rollout status deploy/payments --timeout=180s
+      kubectl -n fin set image deploy/payments nginx=nginx:does-not-exist
+      sleep 10
+      kubectl -n fin rollout undo deploy/payments
+      kubectl -n fin rollout status deploy/payments --timeout=180s
+
+  - id: ctrl-rollout-strategy
+    title: Rolling update knobs - maxSurge, maxUnavailable and Recreate
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [deployments, rolling update, maxSurge, maxUnavailable, recreate]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: Control exactly how many pods go down and how many extra come up.
+    scenario: |
+      Two services with opposite requirements:
+
+      - `frontend` must never lose capacity during a deploy, and may
+        temporarily run extra pods.
+      - `migrator` cannot have two versions running at once - old pods must
+        all die before new ones start.
+
+      Configure each Deployment's update strategy accordingly.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy
+    tasks:
+      - text: "Set `frontend` to a RollingUpdate strategy with `maxUnavailable: 0` and `maxSurge: 2`."
+      - text: "Set `migrator` to the `Recreate` strategy."
+      - text: "Roll both Deployments to image `nginx:1.27-alpine` and leave them healthy."
+    setup:
+      - kind: shell
+        desc: create two deployments with default strategies
+        run: |
+          kubectl create ns rollouts
+          kubectl -n rollouts create deployment frontend --image=nginx:1.25-alpine --replicas=4
+          kubectl -n rollouts create deployment migrator --image=nginx:1.25-alpine --replicas=2
+          kubectl -n rollouts rollout status deploy/frontend --timeout=150s
+          kubectl -n rollouts rollout status deploy/migrator --timeout=150s
+    verify:
+      - id: frontend-strategy
+        desc: frontend uses RollingUpdate with maxUnavailable 0 and maxSurge 2
+        points: 35
+        hint: "spec.strategy.rollingUpdate.maxUnavailable and maxSurge"
+        run: |
+          eq "$(jp deploy frontend '{.spec.strategy.type}' -n rollouts)" "RollingUpdate" || exit 1
+          eq "$(jp deploy frontend '{.spec.strategy.rollingUpdate.maxUnavailable}' -n rollouts)" "0" || exit 1
+          eq "$(jp deploy frontend '{.spec.strategy.rollingUpdate.maxSurge}' -n rollouts)" "2"
+      - id: migrator-strategy
+        desc: migrator uses the Recreate strategy
+        points: 30
+        hint: "spec.strategy.type: Recreate -- and rollingUpdate must be absent"
+        run: |
+          eq "$(jp deploy migrator '{.spec.strategy.type}' -n rollouts)" "Recreate"
+      - id: images
+        desc: Both Deployments run nginx:1.27-alpine
+        points: 20
+        hint: "kubectl -n rollouts set image deploy/frontend nginx=nginx:1.27-alpine"
+        run: |
+          eq "$(jp deploy frontend '{.spec.template.spec.containers[0].image}' -n rollouts)" "nginx:1.27-alpine" || exit 1
+          eq "$(jp deploy migrator '{.spec.template.spec.containers[0].image}' -n rollouts)" "nginx:1.27-alpine"
+      - id: healthy
+        desc: Both Deployments are fully rolled out onto the new image
+        points: 15
+        hint: "kubectl -n rollouts rollout status deploy/frontend"
+        run: |
+          rollout rollouts deploy/frontend 240s || exit 1
+          rollout rollouts deploy/migrator 240s || exit 1
+          for d in frontend:4 migrator:2; do
+            name=${d%%:*}; want=${d##*:}
+            n=$(kubectl -n rollouts get pods -l app=$name \
+                  -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}' \
+                  | grep -c '^nginx:1.27-alpine$')
+            [ "${n:-0}" -eq "$want" ] || exit 1
+          done
+    hints:
+      - title: Patching the strategy
+        cost: 8
+        text: |
+          ```
+          kubectl -n rollouts patch deploy frontend -p \
+            '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":0,"maxSurge":2}}}}'
+          ```
+      - title: Switching to Recreate
+        cost: 10
+        text: |
+          You cannot leave a `rollingUpdate` block behind when type is
+          `Recreate` - the API rejects it. Null it out in the same patch:
+
+          ```
+          kubectl -n rollouts patch deploy migrator -p \
+            '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
+          ```
+      - title: What the numbers mean
+        cost: 10
+        text: |
+          They are relative to `spec.replicas` and can be a count or a
+          percentage. `maxUnavailable: 0` means never drop below full
+          capacity, which forces new pods up first - so `maxSurge` must be
+          at least 1 or the rollout can never make progress.
+    solution: |
+      ```bash
+      kubectl -n rollouts patch deploy frontend -p \
+        '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":2}}}}'
+
+      kubectl -n rollouts patch deploy migrator -p \
+        '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
+
+      kubectl -n rollouts set image deploy/frontend nginx=nginx:1.27-alpine
+      kubectl -n rollouts set image deploy/migrator nginx=nginx:1.27-alpine
+      kubectl -n rollouts rollout status deploy/frontend
+      kubectl -n rollouts rollout status deploy/migrator
+      ```
+    solve_script: |
+      kubectl -n rollouts patch deploy frontend -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":2}}}}'
+      kubectl -n rollouts patch deploy migrator -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
+      kubectl -n rollouts set image deploy/frontend nginx=nginx:1.27-alpine
+      kubectl -n rollouts set image deploy/migrator nginx=nginx:1.27-alpine
+      kubectl -n rollouts rollout status deploy/frontend --timeout=180s
+      kubectl -n rollouts rollout status deploy/migrator --timeout=180s
+
+  - id: ctrl-daemonset
+    title: Run one agent on every node with a DaemonSet
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [daemonsets, node selectors, tolerations, hostPath]
+    par_minutes: 12
+    estimated_minutes: 16
+    cluster:
+      nodes: 3
+    blurb: Log shippers, CNI plugins and node exporters are all DaemonSets.
+    scenario: |
+      This cluster has three nodes: one control plane and two workers. The
+      observability team wants a log-collector agent on **every** node,
+      including the control plane, which carries a `NoSchedule` taint.
+
+      A DaemonSet places exactly one pod per matching node and keeps up with
+      nodes joining and leaving.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
+    tasks:
+      - text: "In namespace `obs`, create a DaemonSet `logshipper` running `busybox:1.36` with command `sleep 3600`."
+      - text: "Mount the host's `/var/log` directory read-only at `/host/var/log` using a `hostPath` volume."
+      - text: "Tolerate the control plane taint so the agent runs there too."
+      - text: "Every node in the cluster must end up running exactly one logshipper pod."
+    setup:
+      - kind: shell
+        desc: create the obs namespace
+        run: kubectl create ns obs
+    verify:
+      - id: exists
+        desc: DaemonSet obs/logshipper exists
+        points: 20
+        hint: "kind: DaemonSet, apiVersion apps/v1 -- there is no kubectl create daemonset"
+        run: |
+          has ds logshipper -n obs
+      - id: hostpath
+        desc: A hostPath volume mounts /var/log read-only at /host/var/log
+        points: 25
+        hint: "volumes: [{name: varlog, hostPath: {path: /var/log}}] plus a readOnly volumeMount"
+        run: |
+          eq "$(jp ds logshipper '{.spec.template.spec.volumes[0].hostPath.path}' -n obs)" "/var/log" || exit 1
+          eq "$(jp ds logshipper '{.spec.template.spec.containers[0].volumeMounts[0].mountPath}' -n obs)" "/host/var/log" || exit 1
+          eq "$(jp ds logshipper '{.spec.template.spec.containers[0].volumeMounts[0].readOnly}' -n obs)" "true"
+      - id: toleration
+        desc: The pod template tolerates the control-plane taint
+        points: 25
+        hint: 'tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}]'
+        run: |
+          jp ds logshipper '{.spec.template.spec.tolerations[*].key}' -n obs \
+            | grep -q 'control-plane'
+      - id: everywhere
+        desc: One ready pod on every node in the cluster
+        points: 30
+        hint: "kubectl -n obs get ds logshipper -- DESIRED should equal your node count"
+        run: |
+          nodes=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+          RETRY=30 retry bash -c "[ \"\$(kubectl -n obs get ds logshipper -o jsonpath='{.status.numberReady}')\" = \"$nodes\" ]"
+    hints:
+      - title: There is no generator for DaemonSets
+        cost: 8
+        text: |
+          Start from a Deployment and convert it:
+
+          ```
+          kubectl -n obs create deployment logshipper --image=busybox:1.36 $do > ds.yaml
+          ```
+          Then change `kind: Deployment` to `kind: DaemonSet` and delete
+          `spec.replicas` and `spec.strategy`.
+      - title: The control plane taint
+        cost: 10
+        text: |
+          Find it with:
+          `kubectl describe node <control-plane> | grep -i taint`
+
+          It is `node-role.kubernetes.io/control-plane:NoSchedule`. Tolerate it:
+
+          ```yaml
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          ```
+      - title: Keeping busybox alive
+        cost: 6
+        text: |
+          busybox exits immediately with no command, and the DaemonSet will
+          restart-loop. Give it `command: ["sleep", "3600"]`.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: logshipper
+        namespace: obs
+      spec:
+        selector:
+          matchLabels:
+            app: logshipper
+        template:
+          metadata:
+            labels:
+              app: logshipper
+          spec:
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            volumes:
+              - name: varlog
+                hostPath:
+                  path: /var/log
+            containers:
+              - name: agent
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: varlog
+                    mountPath: /host/var/log
+                    readOnly: true
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata: {name: logshipper, namespace: obs}
+      spec:
+        selector:
+          matchLabels: {app: logshipper}
+        template:
+          metadata:
+            labels: {app: logshipper}
+          spec:
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            volumes:
+              - name: varlog
+                hostPath: {path: /var/log}
+            containers:
+              - name: agent
+                image: busybox:1.36
+                command: ["sleep", "3600"]
+                volumeMounts:
+                  - name: varlog
+                    mountPath: /host/var/log
+                    readOnly: true
+      YAML
+      kubectl -n obs rollout status ds/logshipper --timeout=180s
+
+  - id: ctrl-statefulset
+    title: StatefulSets - stable names, ordered startup, per-pod storage
+    difficulty: hard
+    exams: [CKA, CKAD]
+    concepts: [statefulsets, headless service, volumeClaimTemplates, ordinals]
+    par_minutes: 16
+    estimated_minutes: 22
+    blurb: The controller for databases - identity that survives rescheduling.
+    scenario: |
+      Deployments give you interchangeable pods. Databases need the
+      opposite: `db-0` must always be `db-0`, must always get its own
+      volume back, and must start before `db-1`.
+
+      That is a StatefulSet, and it needs a *headless* Service (clusterIP:
+      None) to give each pod a stable DNS name of the form
+      `db-0.db.data.svc.cluster.local`.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/
+      - https://kubernetes.io/docs/tasks/run-application/run-replicated-stateful-application/
+    tasks:
+      - text: "In namespace `data`, create a headless Service `db` on port 80 selecting `app=db`."
+      - text: "Create a StatefulSet `db` with 3 replicas of `nginx:1.27-alpine`, using `serviceName: db`."
+      - text: "Give it a `volumeClaimTemplate` named `data` requesting 100Mi, mounted at `/data`."
+      - text: "All three pods must become Ready, and three PVCs must exist."
+    setup:
+      - kind: shell
+        desc: create the data namespace
+        run: kubectl create ns data
+    verify:
+      - id: headless
+        desc: Service data/db is headless (clusterIP None)
+        points: 20
+        hint: "clusterIP: None is what makes it headless"
+        run: |
+          eq "$(jp svc db '{.spec.clusterIP}' -n data)" "None"
+      - id: sts
+        desc: StatefulSet data/db has 3 replicas and serviceName db
+        points: 25
+        hint: "spec.serviceName must match the headless Service name"
+        run: |
+          eq "$(jp sts db '{.spec.replicas}' -n data)" "3" || exit 1
+          eq "$(jp sts db '{.spec.serviceName}' -n data)" "db"
+      - id: vct
+        desc: A volumeClaimTemplate named data requests 100Mi and mounts at /data
+        points: 25
+        hint: "volumeClaimTemplates is a list of PVC specs, sibling of template"
+        run: |
+          eq "$(jp sts db '{.spec.volumeClaimTemplates[0].metadata.name}' -n data)" "data" || exit 1
+          jp sts db '{.spec.volumeClaimTemplates[0].spec.resources.requests.storage}' -n data | grep -q '100Mi' || exit 1
+          jp sts db '{.spec.template.spec.containers[0].volumeMounts[*].mountPath}' -n data | grep -q '/data'
+      - id: pods
+        desc: db-0, db-1 and db-2 are all Ready
+        points: 20
+        hint: "kubectl -n data get pods -w -- they come up strictly in order"
+        run: |
+          RETRY=45 retry bash -c '[ "$(kubectl -n data get sts db -o jsonpath="{.status.readyReplicas}")" = "3" ]' || exit 1
+          has pod db-0 -n data && has pod db-1 -n data && has pod db-2 -n data
+      - id: pvcs
+        desc: Each pod got its own bound PVC
+        points: 10
+        hint: "kubectl -n data get pvc -- named data-db-0, data-db-1, data-db-2"
+        run: |
+          n=$(kubectl -n data get pvc --no-headers 2>/dev/null | grep -c '^data-db-')
+          [ "$n" -eq 3 ]
+    hints:
+      - title: The headless Service
+        cost: 8
+        text: |
+          ```yaml
+          apiVersion: v1
+          kind: Service
+          metadata: {name: db, namespace: data}
+          spec:
+            clusterIP: None
+            selector: {app: db}
+            ports:
+              - port: 80
+          ```
+          Without `clusterIP: None` you get one virtual IP for the set
+          instead of per-pod DNS records.
+      - title: volumeClaimTemplates
+        cost: 12
+        text: |
+          It sits at the same level as `template`, not inside it:
+
+          ```yaml
+          spec:
+            template: {...}
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 100Mi
+          ```
+          The generated PVCs are named `<template>-<pod>`, so `data-db-0`.
+      - title: Ordering
+        cost: 8
+        text: |
+          By default `podManagementPolicy: OrderedReady` - db-1 does not
+          start until db-0 is Ready. If a pod is stuck, the whole set stalls.
+          `kubectl -n data describe pod db-0` tells you why.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Service
+      metadata: {name: db, namespace: data}
+      spec:
+        clusterIP: None
+        selector: {app: db}
+        ports:
+          - port: 80
+            name: web
+      ---
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata: {name: db, namespace: data}
+      spec:
+        serviceName: db
+        replicas: 3
+        selector:
+          matchLabels: {app: db}
+        template:
+          metadata:
+            labels: {app: db}
+          spec:
+            containers:
+              - name: nginx
+                image: nginx:1.27-alpine
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+        volumeClaimTemplates:
+          - metadata:
+              name: data
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 100Mi
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Service
+      metadata: {name: db, namespace: data}
+      spec:
+        clusterIP: None
+        selector: {app: db}
+        ports: [{port: 80, name: web}]
+      ---
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata: {name: db, namespace: data}
+      spec:
+        serviceName: db
+        replicas: 3
+        selector:
+          matchLabels: {app: db}
+        template:
+          metadata:
+            labels: {app: db}
+          spec:
+            containers:
+              - name: nginx
+                image: nginx:1.27-alpine
+                volumeMounts: [{name: data, mountPath: /data}]
+        volumeClaimTemplates:
+          - metadata: {name: data}
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests: {storage: 100Mi}
+      YAML
+      kubectl -n data rollout status sts/db --timeout=300s
+
+  - id: ctrl-jobs
+    title: Jobs - completions, parallelism and backoff
+    difficulty: medium
+    exams: [CKAD, CKA]
+    concepts: [jobs, batch, parallelism, backoffLimit, restartPolicy]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: Batch work that must finish, run N times, M at a time.
+    scenario: |
+      The data team needs a batch job that processes eight shards, running
+      at most three at a time, and which gives up after four failed pod
+      attempts rather than retrying forever.
+
+      They also want a second Job that demonstrates what happens when work
+      keeps failing, so they can see the `backoffLimit` in action.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/job/
+    tasks:
+      - text: "In namespace `batch`, create a Job `shards` running `busybox:1.36` with the command `sh -c 'echo processing; sleep 3'`."
+      - text: "It must have `completions: 8`, `parallelism: 3` and `backoffLimit: 4`."
+      - text: "The Job must run to completion (8 successful pods)."
+      - text: "Create a second Job `doomed` that always fails (`sh -c 'exit 1'`) with `backoffLimit: 2`, and let it reach its Failed condition."
+    setup:
+      - kind: shell
+        desc: create the batch namespace
+        run: kubectl create ns batch
+    verify:
+      - id: spec
+        desc: Job batch/shards has completions 8, parallelism 3, backoffLimit 4
+        points: 30
+        hint: "kubectl -n batch create job shards --image=busybox:1.36 $do -- sh -c 'echo processing; sleep 3'"
+        run: |
+          eq "$(jp job shards '{.spec.completions}' -n batch)" "8" || exit 1
+          eq "$(jp job shards '{.spec.parallelism}' -n batch)" "3" || exit 1
+          eq "$(jp job shards '{.spec.backoffLimit}' -n batch)" "4"
+      - id: succeeded
+        desc: The shards Job completed all 8 runs
+        points: 30
+        hint: "kubectl -n batch get job shards -w"
+        run: |
+          RETRY=45 retry bash -c '[ "$(kubectl -n batch get job shards -o jsonpath="{.status.succeeded}")" = "8" ]'
+      - id: doomed-spec
+        desc: Job batch/doomed has backoffLimit 2
+        points: 15
+        hint: "spec.backoffLimit: 2"
+        run: |
+          eq "$(jp job doomed '{.spec.backoffLimit}' -n batch)" "2"
+      - id: doomed-failed
+        desc: The doomed Job gave up and is marked Failed
+        points: 25
+        hint: "wait for it -- backoff is exponential, roughly 10s, 20s, 40s"
+        run: |
+          RETRY=60 retry bash -c '
+            kubectl -n batch get job doomed -o jsonpath="{.status.conditions[?(@.type==\"Failed\")].status}" | grep -q True'
+    hints:
+      - title: Generating a Job
+        cost: 8
+        text: |
+          ```
+          kubectl -n batch create job shards --image=busybox:1.36 $do \
+            -- sh -c 'echo processing; sleep 3' > shards.yaml
+          ```
+          Then add `completions`, `parallelism` and `backoffLimit` under
+          `spec` (siblings of `template`, not inside it).
+      - title: restartPolicy matters
+        cost: 10
+        text: |
+          A Job's pod template must set `restartPolicy: Never` or
+          `OnFailure` - `Always` is rejected. The generator already writes
+          `Never` for you.
+      - title: How backoffLimit counts
+        cost: 10
+        text: |
+          It counts *pod failures*, not seconds. With `backoffLimit: 2` you
+          get three attempts total, with exponential backoff between them,
+          then `status.conditions[type=Failed]` becomes True.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: batch/v1
+      kind: Job
+      metadata: {name: shards, namespace: batch}
+      spec:
+        completions: 8
+        parallelism: 3
+        backoffLimit: 4
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: worker
+                image: busybox:1.36
+                command: ["sh", "-c", "echo processing; sleep 3"]
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata: {name: doomed, namespace: batch}
+      spec:
+        backoffLimit: 2
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: worker
+                image: busybox:1.36
+                command: ["sh", "-c", "exit 1"]
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: batch/v1
+      kind: Job
+      metadata: {name: shards, namespace: batch}
+      spec:
+        completions: 8
+        parallelism: 3
+        backoffLimit: 4
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: worker
+                image: busybox:1.36
+                command: ["sh", "-c", "echo processing; sleep 3"]
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata: {name: doomed, namespace: batch}
+      spec:
+        backoffLimit: 2
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: worker
+                image: busybox:1.36
+                command: ["sh", "-c", "exit 1"]
+      YAML
+      kubectl -n batch wait --for=condition=complete job/shards --timeout=240s
+      kubectl -n batch wait --for=condition=failed job/doomed --timeout=240s
+
+  - id: ctrl-cronjob
+    title: CronJobs and the knobs that stop them piling up
+    difficulty: medium
+    exams: [CKAD]
+    concepts: [cronjobs, scheduling, concurrencyPolicy, history limits, suspend]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: Schedules, overlap policy, history retention and how to suspend one safely.
+    scenario: |
+      A `report` CronJob has been running every minute for weeks, each run
+      taking longer than a minute. The namespace is now full of completed
+      Jobs and overlapping runs are corrupting the output.
+
+      Fix the configuration, and suspend a second CronJob that must not fire
+      while a migration is under way.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/
+    tasks:
+      - text: "Set CronJob `ops/report` to `concurrencyPolicy: Forbid` so a run never overlaps the previous one."
+      - text: "Keep only 2 successful and 1 failed Job in its history."
+      - text: "Give it a `startingDeadlineSeconds` of 30 so a missed schedule is skipped rather than fired late."
+      - text: "Suspend the CronJob `ops/cleanup` so it does not fire at all."
+      - text: "Trigger `report` manually once, creating a Job called `report-manual`, and let it succeed."
+    setup:
+      - kind: shell
+        desc: create two badly configured cronjobs
+        run: |
+          kubectl create ns ops
+          kubectl -n ops create cronjob report --image=busybox:1.36 --schedule="*/1 * * * *" -- sh -c 'echo reporting; sleep 2'
+          kubectl -n ops create cronjob cleanup --image=busybox:1.36 --schedule="*/5 * * * *" -- sh -c 'echo cleaning'
+    verify:
+      - id: concurrency
+        desc: report uses concurrencyPolicy Forbid
+        points: 25
+        hint: "kubectl -n ops patch cronjob report -p '{\"spec\":{\"concurrencyPolicy\":\"Forbid\"}}'"
+        run: |
+          eq "$(jp cronjob report '{.spec.concurrencyPolicy}' -n ops)" "Forbid"
+      - id: history
+        desc: History limits are 2 successful and 1 failed
+        points: 25
+        hint: "successfulJobsHistoryLimit and failedJobsHistoryLimit"
+        run: |
+          eq "$(jp cronjob report '{.spec.successfulJobsHistoryLimit}' -n ops)" "2" || exit 1
+          eq "$(jp cronjob report '{.spec.failedJobsHistoryLimit}' -n ops)" "1"
+      - id: deadline
+        desc: startingDeadlineSeconds is 30
+        points: 20
+        hint: "spec.startingDeadlineSeconds: 30"
+        run: |
+          eq "$(jp cronjob report '{.spec.startingDeadlineSeconds}' -n ops)" "30"
+      - id: suspended
+        desc: The cleanup CronJob is suspended
+        points: 15
+        hint: "kubectl -n ops patch cronjob cleanup -p '{\"spec\":{\"suspend\":true}}'"
+        run: |
+          eq "$(jp cronjob cleanup '{.spec.suspend}' -n ops)" "true"
+      - id: manual
+        desc: A manual Job report-manual ran from the CronJob and succeeded
+        points: 15
+        hint: "kubectl -n ops create job report-manual --from=cronjob/report"
+        run: |
+          has job report-manual -n ops || exit 1
+          RETRY=30 retry bash -c '[ "$(kubectl -n ops get job report-manual -o jsonpath="{.status.succeeded}")" = "1" ]'
+    hints:
+      - title: Patching several fields at once
+        cost: 8
+        text: |
+          ```
+          kubectl -n ops patch cronjob report -p '{"spec":{
+            "concurrencyPolicy":"Forbid",
+            "successfulJobsHistoryLimit":2,
+            "failedJobsHistoryLimit":1,
+            "startingDeadlineSeconds":30}}'
+          ```
+      - title: Running a CronJob on demand
+        cost: 8
+        text: |
+          ```
+          kubectl -n ops create job report-manual --from=cronjob/report
+          ```
+          This copies the CronJob's jobTemplate into a one-off Job - handy
+          for testing a schedule without waiting for it.
+      - title: The three concurrency policies
+        cost: 10
+        text: |
+          - `Allow` (default): runs may overlap
+          - `Forbid`: skip the new run if the previous one is still going
+          - `Replace`: kill the running one and start the new one
+    solution: |
+      ```bash
+      kubectl -n ops patch cronjob report -p '{"spec":{
+        "concurrencyPolicy":"Forbid",
+        "successfulJobsHistoryLimit":2,
+        "failedJobsHistoryLimit":1,
+        "startingDeadlineSeconds":30}}'
+
+      kubectl -n ops patch cronjob cleanup -p '{"spec":{"suspend":true}}'
+
+      kubectl -n ops create job report-manual --from=cronjob/report
+      kubectl -n ops wait --for=condition=complete job/report-manual --timeout=120s
+      ```
+    solve_script: |
+      kubectl -n ops patch cronjob report -p '{"spec":{"concurrencyPolicy":"Forbid","successfulJobsHistoryLimit":2,"failedJobsHistoryLimit":1,"startingDeadlineSeconds":30}}'
+      kubectl -n ops patch cronjob cleanup -p '{"spec":{"suspend":true}}'
+      kubectl -n ops create job report-manual --from=cronjob/report
+      kubectl -n ops wait --for=condition=complete job/report-manual --timeout=180s
+
+  - id: ctrl-hpa
+    title: Autoscale a Deployment with an HPA
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [hpa, autoscaling, metrics-server, resource requests]
+    par_minutes: 14
+    estimated_minutes: 18
+    cluster:
+      install:
+        - name: metrics-server
+          timeout: 420
+          run: |
+            kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+            kubectl -n kube-system patch deployment metrics-server --type=json \
+              -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+            kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s
+    blurb: HPAs need resource requests and a metrics API - both are usually the missing piece.
+    scenario: |
+      The `api` Deployment needs to scale between 2 and 10 replicas at 60%
+      average CPU. metrics-server is already installed in this cluster.
+
+      The classic gotcha: an HPA that targets CPU **percentage** is
+      computing a percentage *of the pod's CPU request*. With no request
+      set, there is nothing to take a percentage of, and the HPA reports
+      `<unknown>` forever.
+    docs:
+      - https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+    tasks:
+      - text: "Give the container in Deployment `scale/api` a CPU request of 100m."
+      - text: "Create a HorizontalPodAutoscaler `api` targeting that Deployment: min 2, max 10, 60% average CPU."
+      - text: "Confirm the HPA is actually reading metrics (its current CPU is a number, not `<unknown>`)."
+    setup:
+      - kind: shell
+        desc: deploy an api with no resource requests
+        run: |
+          kubectl create ns scale
+          kubectl -n scale create deployment api --image=nginx:1.27-alpine --replicas=2
+          kubectl -n scale rollout status deploy/api --timeout=180s
+    verify:
+      - id: request
+        desc: The api container requests 100m CPU
+        points: 30
+        hint: "kubectl -n scale set resources deploy/api --requests=cpu=100m"
+        run: |
+          eq "$(jp deploy api '{.spec.template.spec.containers[0].resources.requests.cpu}' -n scale)" "100m"
+      - id: hpa
+        desc: An HPA named api targets the Deployment with min 2 / max 10 / 60%
+        points: 35
+        hint: "kubectl -n scale autoscale deploy api --min=2 --max=10 --cpu-percent=60"
+        run: |
+          eq "$(jp hpa api '{.spec.minReplicas}' -n scale)" "2" || exit 1
+          eq "$(jp hpa api '{.spec.maxReplicas}' -n scale)" "10" || exit 1
+          eq "$(jp hpa api '{.spec.scaleTargetRef.name}' -n scale)" "api" || exit 1
+          jp hpa api '{.spec.metrics[0].resource.target.averageUtilization}' -n scale | grep -q '^60$'
+      - id: metrics
+        desc: The HPA is reading real CPU metrics (not unknown)
+        points: 35
+        hint: "kubectl -n scale get hpa api -- give metrics-server up to a minute to have data"
+        run: |
+          RETRY=45 retry bash -c '
+            kubectl -n scale get hpa api -o jsonpath="{.status.currentMetrics[0].resource.current.averageUtilization}" \
+              | grep -Eq "^[0-9]+$"'
+    hints:
+      - title: Setting a request on a live Deployment
+        cost: 8
+        text: |
+          ```
+          kubectl -n scale set resources deploy/api --requests=cpu=100m
+          ```
+          That triggers a rollout, which is expected.
+      - title: Creating the HPA
+        cost: 8
+        text: |
+          ```
+          kubectl -n scale autoscale deployment api --min=2 --max=10 --cpu-percent=60
+          ```
+      - title: When the HPA says unknown
+        cost: 12
+        text: |
+          Check in this order:
+
+          1. `kubectl top pods -n scale` - if that fails, metrics-server is unhealthy
+          2. `kubectl -n scale describe hpa api` - the events explain it
+          3. Does the pod have a CPU *request*? Without one, utilisation is undefined.
+    solution: |
+      ```bash
+      kubectl -n scale set resources deploy/api --requests=cpu=100m
+      kubectl -n scale rollout status deploy/api
+
+      kubectl -n scale autoscale deployment api --min=2 --max=10 --cpu-percent=60
+
+      kubectl -n scale get hpa api -w    # TARGETS goes from <unknown> to 0%/60%
+      ```
+    solve_script: |
+      kubectl -n scale set resources deploy/api --requests=cpu=100m
+      kubectl -n scale rollout status deploy/api --timeout=180s
+      kubectl -n scale autoscale deployment api --min=2 --max=10 --cpu-percent=60
+      sleep 60
+
+  - id: ctrl-pdb
+    title: PodDisruptionBudgets and the eviction budget they compute
+    difficulty: medium
+    exams: [CKA]
+    concepts: [pdb, disruption, drain, eviction, availability]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Declare how much voluntary disruption a workload tolerates, and read the budget back.
+    scenario: |
+      A PodDisruptionBudget limits *voluntary* disruption - drains,
+      evictions, node pool rotations. It does nothing about a node
+      crashing; that is involuntary and no budget can stop it.
+
+      The controller turns your budget into a live number,
+      `status.disruptionsAllowed`: how many pods the eviction API will let
+      anyone remove right now. That number is the thing to understand,
+      because it is what makes a `kubectl drain` proceed or hang forever.
+
+      Two workloads, two very different policies.
+    docs:
+      - https://kubernetes.io/docs/tasks/run-application/configure-pdb/
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/api-eviction/
+    tasks:
+      - text: "Create a PodDisruptionBudget `web-pdb` in `avail` requiring at least 2 pods of `app=web` to stay available."
+      - text: "Create a PodDisruptionBudget `db-pdb` in `avail` for `app=db` with `maxUnavailable: 0` - the database must never be voluntarily disrupted."
+      - text: "Read the computed budgets back and record them in a ConfigMap `pdbinfo` in `avail`: key `web_allowed` and key `db_allowed`, each the `disruptionsAllowed` value."
+      - text: "Both Deployments must stay fully available throughout."
+    setup:
+      - kind: shell
+        desc: deploy a 4-replica web tier and a 2-replica database
+        run: |
+          kubectl create ns avail
+          kubectl -n avail create deployment web --image=nginx:1.27-alpine --replicas=4
+          kubectl -n avail create deployment db --image=nginx:1.27-alpine --replicas=2
+          kubectl -n avail rollout status deploy/web --timeout=240s
+          kubectl -n avail rollout status deploy/db --timeout=240s
+    verify:
+      - id: web-pdb
+        desc: PDB avail/web-pdb requires minAvailable 2 for app=web
+        points: 25
+        hint: "kubectl -n avail create pdb web-pdb --selector=app=web --min-available=2"
+        run: |
+          eq "$(jp pdb web-pdb '{.spec.minAvailable}' -n avail)" "2" || exit 1
+          eq "$(jp pdb web-pdb '{.spec.selector.matchLabels.app}' -n avail)" "web"
+      - id: db-pdb
+        desc: PDB avail/db-pdb sets maxUnavailable 0 for app=db
+        points: 25
+        hint: "kubectl -n avail create pdb db-pdb --selector=app=db --max-unavailable=0"
+        run: |
+          eq "$(jp pdb db-pdb '{.spec.maxUnavailable}' -n avail)" "0" || exit 1
+          eq "$(jp pdb db-pdb '{.spec.selector.matchLabels.app}' -n avail)" "db"
+      - id: budgets
+        desc: The controller computed 2 allowed disruptions for web and 0 for db
+        points: 30
+        hint: "kubectl -n avail get pdb -- the ALLOWED DISRUPTIONS column"
+        run: |
+          RETRY=25 retry bash -c '[ "$(kubectl -n avail get pdb web-pdb -o jsonpath="{.status.disruptionsAllowed}")" = "2" ]' || exit 1
+          RETRY=25 retry bash -c '[ "$(kubectl -n avail get pdb db-pdb -o jsonpath="{.status.disruptionsAllowed}")" = "0" ]'
+      - id: recorded
+        desc: You recorded both computed budgets
+        points: 20
+        hint: "kubectl -n avail get pdb web-pdb -o jsonpath='{.status.disruptionsAllowed}'"
+        run: |
+          eq "$(jp cm pdbinfo '{.data.web_allowed}' -n avail | tr -d ' ')" "2" || exit 1
+          eq "$(jp cm pdbinfo '{.data.db_allowed}' -n avail | tr -d ' ')" "0"
+      - id: still-up
+        desc: Both Deployments are still fully available
+        points: 0
+        hint: "a PDB never removes pods by itself"
+        run: |
+          eq "$(jp deploy web '{.status.readyReplicas}' -n avail)" "4" || exit 1
+          eq "$(jp deploy db '{.status.readyReplicas}' -n avail)" "2"
+    hints:
+      - title: Creating the budgets
+        cost: 8
+        text: |
+          ```
+          kubectl -n avail create pdb web-pdb --selector=app=web --min-available=2
+          kubectl -n avail create pdb db-pdb  --selector=app=db  --max-unavailable=0
+          ```
+          Use one of `--min-available` or `--max-unavailable`, never both.
+      - title: Reading the computed budget
+        cost: 8
+        text: |
+          ```
+          kubectl -n avail get pdb
+          kubectl -n avail get pdb web-pdb -o jsonpath='{.status.disruptionsAllowed}'
+          ```
+          With 4 healthy pods and `minAvailable: 2`, two may be evicted at
+          once. With `maxUnavailable: 0`, none may ever be - which is
+          exactly what makes a drain of that node hang.
+      - title: Try it for yourself
+        cost: 10
+        text: |
+          Ask the eviction API directly and watch it refuse:
+
+          ```
+          POD=$(kubectl -n avail get pod -l app=db -o name | head -1 | cut -d/ -f2)
+          kubectl -n avail delete pod $POD --dry-run=server   # delete is not eviction
+          kubectl drain <node> --ignore-daemonsets --timeout=20s
+          ```
+          The drain reports
+          `Cannot evict pod as it would violate the pod's disruption budget`
+          and keeps retrying until the timeout.
+    solution: |
+      ```bash
+      kubectl -n avail create pdb web-pdb --selector=app=web --min-available=2
+      kubectl -n avail create pdb db-pdb  --selector=app=db  --max-unavailable=0
+
+      kubectl -n avail get pdb
+      WEB=$(kubectl -n avail get pdb web-pdb -o jsonpath='{.status.disruptionsAllowed}')
+      DB=$(kubectl -n avail get pdb db-pdb -o jsonpath='{.status.disruptionsAllowed}')
+
+      kubectl -n avail create configmap pdbinfo \
+        --from-literal=web_allowed=$WEB --from-literal=db_allowed=$DB
+      ```
+    solve_script: |
+      kubectl -n avail create pdb web-pdb --selector=app=web --min-available=2
+      kubectl -n avail create pdb db-pdb --selector=app=db --max-unavailable=0
+      sleep 15
+      WEB=$(kubectl -n avail get pdb web-pdb -o jsonpath='{.status.disruptionsAllowed}')
+      DB=$(kubectl -n avail get pdb db-pdb -o jsonpath='{.status.disruptionsAllowed}')
+      kubectl -n avail create configmap pdbinfo --from-literal=web_allowed=$WEB --from-literal=db_allowed=$DB

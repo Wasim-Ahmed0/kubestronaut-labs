@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubestronaut Labs</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/labs">
+    <span class="logo">⎈</span>
+    <span>
+      <b>Kubestronaut</b>
+      <small>KCNA · KCSA · CKA · CKAD · CKS</small>
+    </span>
+  </a>
+  <nav class="nav">
+    <a href="#/path" data-route="path">Path</a>
+    <a href="#/labs" data-route="labs">Labs</a>
+    <a href="#/progress" data-route="progress">Progress</a>
+  </nav>
+  <div class="topright">
+    <div id="runner" class="pill runner" title="Is the klab terminal listening?">
+      <span class="dot"></span><span class="txt">terminal</span>
+    </div>
+    <div id="overall" class="overall"></div>
+  </div>
+</header>
+
+<div id="session-strip" class="session-strip hidden"></div>
+
+<main id="view"></main>
+
+<footer class="foot">
+  <span>Progress is stored in <code>~/.kubestronaut/state.json</code></span>
+  <span id="foot-count"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

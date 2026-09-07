@@ -1,0 +1,585 @@
+category: Extending Kubernetes
+labs:
+
+  - id: ext-crd
+    title: Define your own resource type with a CRD
+    difficulty: hard
+    exams: [CKA, CKAD, KCNA]
+    concepts: [crd, custom resources, api extension, openapi schema, validation]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: Teach the API server a new noun, complete with validation and kubectl support.
+    scenario: |
+      A CustomResourceDefinition adds a new kind to the Kubernetes API. From
+      that moment `kubectl get`, RBAC, labels, watches and everything else
+      work on it exactly as they do on built-in types - that consistency is
+      the whole point of the extension model.
+
+      A CRD on its own only stores data. A **controller** watching that type
+      and acting on it is what makes an "operator"; the CRD is just the API.
+
+      Define a `Backup` type for a fictional backup operator, with a schema
+      that actually validates input.
+    docs:
+      - https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/
+    tasks:
+      - text: "Create a namespaced CRD for `backups.klab.io` with kind `Backup`, plural `backups`, singular `backup`, shortName `bk`, version `v1` (served and storage)."
+      - text: "Its schema must require `spec.schedule` (string) and `spec.retentionDays` (integer, minimum 1, maximum 90)."
+      - text: "Add printer columns so `kubectl get backups` shows the schedule and the retention."
+      - text: "Create a Backup called `nightly` in namespace `ops` with schedule `0 2 * * *` and retentionDays 14."
+      - text: "Prove validation works: a Backup with retentionDays 500 must be rejected."
+    setup:
+      - kind: shell
+        desc: create the ops namespace
+        run: |
+          kubectl create ns ops --dry-run=client -o yaml | kubectl apply -f -
+          kubectl delete crd backups.klab.io --ignore-not-found
+    verify:
+      - id: crd
+        desc: The CRD backups.klab.io is Established
+        points: 30
+        hint: "kubectl get crd backups.klab.io -- the Established condition means the API is live"
+        run: |
+          RETRY=20 retry bash -c '
+            kubectl get crd backups.klab.io -o jsonpath="{.status.conditions[?(@.type==\"Established\")].status}" \
+              | grep -q True' || exit 1
+          eq "$(jp crd backups.klab.io '{.spec.names.kind}')" "Backup" || exit 1
+          eq "$(jp crd backups.klab.io '{.spec.scope}')" "Namespaced"
+      - id: shortname
+        desc: kubectl accepts the short name bk
+        points: 15
+        hint: "spec.names.shortNames: [bk]"
+        run: |
+          jp crd backups.klab.io '{.spec.names.shortNames[*]}' | grep -q 'bk'
+      - id: printer-columns
+        desc: kubectl get backups shows schedule and retention columns
+        points: 20
+        hint: "spec.versions[0].additionalPrinterColumns with jsonPath entries"
+        run: |
+          cols=$(jp crd backups.klab.io '{.spec.versions[0].additionalPrinterColumns[*].jsonPath}')
+          echo "$cols" | grep -q 'schedule' && echo "$cols" | grep -qi 'retention'
+      - id: instance
+        desc: A Backup named nightly exists in ops with the right values
+        points: 20
+        hint: "kubectl -n ops apply -f your-backup.yaml"
+        run: |
+          eq "$(jp backup nightly '{.spec.schedule}' -n ops)" "0 2 * * *" || exit 1
+          eq "$(jp backup nightly '{.spec.retentionDays}' -n ops)" "14"
+      - id: validation
+        desc: The schema really rejects an out-of-range retention
+        points: 15
+        hint: "maximum: 90 on the retentionDays property"
+        run: |
+          out=$(kubectl -n ops apply --dry-run=server -f - 2>&1 <<'YAML' || true
+          apiVersion: klab.io/v1
+          kind: Backup
+          metadata:
+            name: klab-toolong
+          spec:
+            schedule: "0 3 * * *"
+            retentionDays: 500
+          YAML
+          )
+          echo "$out" | grep -qiE 'invalid|denied|less than or equal|maximum'
+    hints:
+      - title: The CRD skeleton
+        cost: 12
+        text: |
+          ```yaml
+          apiVersion: apiextensions.k8s.io/v1
+          kind: CustomResourceDefinition
+          metadata:
+            name: backups.klab.io          # must be <plural>.<group>
+          spec:
+            group: klab.io
+            scope: Namespaced
+            names:
+              kind: Backup
+              plural: backups
+              singular: backup
+              shortNames: ["bk"]
+            versions:
+              - name: v1
+                served: true
+                storage: true
+                schema:
+                  openAPIV3Schema:
+                    type: object
+                    properties:
+                      spec:
+                        type: object
+                        required: ["schedule", "retentionDays"]
+                        properties:
+                          schedule:
+                            type: string
+                          retentionDays:
+                            type: integer
+                            minimum: 1
+                            maximum: 90
+          ```
+          The metadata name **must** be `plural.group` exactly, or the CRD
+          is rejected.
+      - title: Printer columns
+        cost: 10
+        text: |
+          ```yaml
+              - name: v1
+                served: true
+                storage: true
+                additionalPrinterColumns:
+                  - name: Schedule
+                    type: string
+                    jsonPath: .spec.schedule
+                  - name: Retention
+                    type: integer
+                    jsonPath: .spec.retentionDays
+                schema: {...}
+          ```
+          They sit at the version level, next to `schema`.
+      - title: Using your new type
+        cost: 8
+        text: |
+          ```
+          kubectl api-resources | grep klab.io
+          kubectl explain backup.spec
+          kubectl -n ops get bk
+          ```
+          `kubectl explain` works on your CRD because it reads the OpenAPI
+          schema you supplied - another reason to write a real schema rather
+          than `x-kubernetes-preserve-unknown-fields: true`.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        name: backups.klab.io
+      spec:
+        group: klab.io
+        scope: Namespaced
+        names:
+          kind: Backup
+          plural: backups
+          singular: backup
+          shortNames: ["bk"]
+        versions:
+          - name: v1
+            served: true
+            storage: true
+            additionalPrinterColumns:
+              - name: Schedule
+                type: string
+                jsonPath: .spec.schedule
+              - name: Retention
+                type: integer
+                jsonPath: .spec.retentionDays
+            schema:
+              openAPIV3Schema:
+                type: object
+                properties:
+                  spec:
+                    type: object
+                    required: ["schedule", "retentionDays"]
+                    properties:
+                      schedule:
+                        type: string
+                      retentionDays:
+                        type: integer
+                        minimum: 1
+                        maximum: 90
+      YAML
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: klab.io/v1
+      kind: Backup
+      metadata:
+        name: nightly
+        namespace: ops
+      spec:
+        schedule: "0 2 * * *"
+        retentionDays: 14
+      YAML
+
+      kubectl -n ops get bk
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        name: backups.klab.io
+      spec:
+        group: klab.io
+        scope: Namespaced
+        names:
+          kind: Backup
+          plural: backups
+          singular: backup
+          shortNames: ["bk"]
+        versions:
+          - name: v1
+            served: true
+            storage: true
+            additionalPrinterColumns:
+              - name: Schedule
+                type: string
+                jsonPath: .spec.schedule
+              - name: Retention
+                type: integer
+                jsonPath: .spec.retentionDays
+            schema:
+              openAPIV3Schema:
+                type: object
+                properties:
+                  spec:
+                    type: object
+                    required: ["schedule", "retentionDays"]
+                    properties:
+                      schedule:
+                        type: string
+                      retentionDays:
+                        type: integer
+                        minimum: 1
+                        maximum: 90
+      YAML
+      sleep 8
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: klab.io/v1
+      kind: Backup
+      metadata: {name: nightly, namespace: ops}
+      spec:
+        schedule: "0 2 * * *"
+        retentionDays: 14
+      YAML
+
+  - id: ext-operator-rbac
+    title: Give a controller exactly the permissions it needs
+    difficulty: hard
+    exams: [CKA, CKS]
+    concepts: [operators, controllers, rbac, crd, finalizers, ownerReferences]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: Operators need broad permissions. Broad does not have to mean cluster-admin.
+    scenario: |
+      An operator is a controller that watches a custom resource and makes
+      the cluster match it. To do that it genuinely needs write access to
+      real resources - which is why so many operator install guides just
+      bind `cluster-admin` and move on.
+
+      Do it properly. The `backup-operator` ServiceAccount must be able to:
+
+      - fully manage `backups.klab.io` custom resources cluster-wide
+      - update the **status** subresource of those backups
+      - create and delete CronJobs and read Pods
+      - and nothing else - no Secrets, no RBAC changes
+
+      Note that `backups/status` is a *separate* RBAC resource from
+      `backups`. Forgetting it is the single most common reason a controller
+      cannot write its status back.
+    docs:
+      - https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
+      - https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources
+    tasks:
+      - text: "Create a ServiceAccount `backup-operator` in namespace `operators`."
+      - text: "Create a ClusterRole `backup-operator` granting all verbs on `backups.klab.io`, plus `get/update/patch` on `backups/status`."
+      - text: "The same ClusterRole must allow create, delete, get, list and watch on `cronjobs.batch`, and get/list/watch on `pods`."
+      - text: "Bind it cluster-wide with ClusterRoleBinding `backup-operator`."
+      - text: "The ServiceAccount must NOT be able to read Secrets or create ClusterRoleBindings."
+    setup:
+      - kind: shell
+        desc: install the Backup CRD and the operators namespace
+        run: |
+          kubectl create ns operators
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apiextensions.k8s.io/v1
+          kind: CustomResourceDefinition
+          metadata:
+            name: backups.klab.io
+          spec:
+            group: klab.io
+            scope: Namespaced
+            names:
+              kind: Backup
+              plural: backups
+              singular: backup
+              shortNames: ["bk"]
+            versions:
+              - name: v1
+                served: true
+                storage: true
+                subresources:
+                  status: {}
+                schema:
+                  openAPIV3Schema:
+                    type: object
+                    properties:
+                      spec:
+                        type: object
+                        properties:
+                          schedule: {type: string}
+                      status:
+                        type: object
+                        properties:
+                          lastRun: {type: string}
+          YAML
+    verify:
+      - id: sa
+        desc: ServiceAccount operators/backup-operator exists
+        points: 10
+        hint: "kubectl -n operators create serviceaccount backup-operator"
+        run: |
+          has sa backup-operator -n operators
+      - id: crd-access
+        desc: It can fully manage Backup resources cluster-wide
+        points: 30
+        hint: "apiGroups: [klab.io], resources: [backups], verbs: [*]"
+        run: |
+          for v in get list watch create update patch delete; do
+            kubectl auth can-i $v backups.klab.io \
+              --as=system:serviceaccount:operators:backup-operator -A 2>/dev/null | grep -qx yes || exit 1
+          done
+      - id: status-access
+        desc: It can update the backups status subresource
+        points: 25
+        hint: "backups/status is a separate entry in the resources list"
+        run: |
+          kubectl auth can-i update backups.klab.io/status \
+            --as=system:serviceaccount:operators:backup-operator -A 2>/dev/null | grep -qx yes
+      - id: cronjobs
+        desc: It can create and delete CronJobs and read Pods
+        points: 20
+        hint: "apiGroups: [batch] for cronjobs, the empty group for pods"
+        run: |
+          kubectl auth can-i create cronjobs.batch \
+            --as=system:serviceaccount:operators:backup-operator -A 2>/dev/null | grep -qx yes || exit 1
+          kubectl auth can-i delete cronjobs.batch \
+            --as=system:serviceaccount:operators:backup-operator -A 2>/dev/null | grep -qx yes || exit 1
+          kubectl auth can-i list pods \
+            --as=system:serviceaccount:operators:backup-operator -A 2>/dev/null | grep -qx yes
+      - id: no-overreach
+        desc: It cannot read Secrets or grant itself more access
+        points: 15
+        hint: "if these say yes, you granted a wildcard somewhere"
+        run: |
+          kubectl auth can-i get secrets \
+            --as=system:serviceaccount:operators:backup-operator -A 2>/dev/null | grep -qx no || exit 1
+          kubectl auth can-i create clusterrolebindings.rbac.authorization.k8s.io \
+            --as=system:serviceaccount:operators:backup-operator -A 2>/dev/null | grep -qx no
+    hints:
+      - title: The ClusterRole
+        cost: 12
+        text: |
+          ```yaml
+          rules:
+            - apiGroups: ["klab.io"]
+              resources: ["backups"]
+              verbs: ["*"]
+            - apiGroups: ["klab.io"]
+              resources: ["backups/status"]
+              verbs: ["get", "update", "patch"]
+            - apiGroups: ["batch"]
+              resources: ["cronjobs"]
+              verbs: ["create", "delete", "get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["pods"]
+              verbs: ["get", "list", "watch"]
+          ```
+      - title: Subresources in RBAC
+        cost: 10
+        text: |
+          Subresources are addressed with a slash: `pods/log`, `pods/exec`,
+          `deployments/scale`, `backups/status`. Access to the parent does
+          **not** imply access to the subresource, which is exactly why
+          `pods/exec` can be withheld from someone who can read pods.
+      - title: Binding it
+        cost: 8
+        text: |
+          ```
+          kubectl create clusterrolebinding backup-operator \
+            --clusterrole=backup-operator \
+            --serviceaccount=operators:backup-operator
+
+          kubectl auth can-i --list \
+            --as=system:serviceaccount:operators:backup-operator | head -20
+          ```
+    solution: |
+      ```bash
+      kubectl -n operators create serviceaccount backup-operator
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata: {name: backup-operator}
+      rules:
+        - apiGroups: ["klab.io"]
+          resources: ["backups"]
+          verbs: ["*"]
+        - apiGroups: ["klab.io"]
+          resources: ["backups/status"]
+          verbs: ["get", "update", "patch"]
+        - apiGroups: ["batch"]
+          resources: ["cronjobs"]
+          verbs: ["create", "delete", "get", "list", "watch"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list", "watch"]
+      YAML
+
+      kubectl create clusterrolebinding backup-operator \
+        --clusterrole=backup-operator --serviceaccount=operators:backup-operator
+
+      kubectl auth can-i --list --as=system:serviceaccount:operators:backup-operator | head
+      ```
+    solve_script: |
+      kubectl -n operators create serviceaccount backup-operator
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata: {name: backup-operator}
+      rules:
+        - apiGroups: ["klab.io"]
+          resources: ["backups"]
+          verbs: ["*"]
+        - apiGroups: ["klab.io"]
+          resources: ["backups/status"]
+          verbs: ["get", "update", "patch"]
+        - apiGroups: ["batch"]
+          resources: ["cronjobs"]
+          verbs: ["create", "delete", "get", "list", "watch"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list", "watch"]
+      YAML
+      kubectl create clusterrolebinding backup-operator \
+        --clusterrole=backup-operator --serviceaccount=operators:backup-operator
+      sleep 5
+
+  - id: ext-owner-references
+    title: Ownership, garbage collection and finalizers
+    difficulty: hard
+    exams: [CKA]
+    concepts: [ownerReferences, garbage collection, cascading delete, finalizers]
+    par_minutes: 15
+    estimated_minutes: 20
+    blurb: Why deleting a Deployment deletes its pods, and why a namespace gets stuck Terminating.
+    scenario: |
+      Kubernetes has no delete-cascade logic in each controller. There is
+      one general mechanism: every child object carries an
+      `ownerReference` pointing at its parent, and the garbage collector
+      deletes orphans.
+
+      That single fact explains a lot:
+
+      - deleting a Deployment removes its ReplicaSets and pods
+      - `--cascade=orphan` leaves the children behind, with the reference stripped
+      - a stuck `Terminating` namespace is almost always a **finalizer** on
+        some object refusing to let go
+
+      See all three for yourself.
+    docs:
+      - https://kubernetes.io/docs/concepts/architecture/garbage-collection/
+      - https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/
+    tasks:
+      - text: "In namespace `gc`, confirm the ReplicaSet behind Deployment `owner-demo` has an ownerReference to that Deployment. Record the owner's kind in ConfigMap `gcinfo` key `rs_owner_kind`."
+      - text: "Delete Deployment `orphan-demo` with `--cascade=orphan` so its ReplicaSet and pods survive."
+      - text: "There is a ConfigMap `stuck` in `gc` with a custom finalizer that will not let it be deleted. Remove the finalizer so it can go."
+      - text: "The ConfigMap `stuck` must be gone, and the orphaned ReplicaSet must still be running its pods."
+    setup:
+      - kind: shell
+        desc: create two deployments and a finalizer-blocked ConfigMap
+        run: |
+          kubectl create ns gc
+          kubectl -n gc create deployment owner-demo --image=registry.k8s.io/pause:3.9 --replicas=1
+          kubectl -n gc create deployment orphan-demo --image=registry.k8s.io/pause:3.9 --replicas=2
+          kubectl -n gc rollout status deploy/owner-demo --timeout=240s
+          kubectl -n gc rollout status deploy/orphan-demo --timeout=240s
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: stuck
+            namespace: gc
+            finalizers:
+              - klab.io/never-let-go
+          data:
+            note: "try deleting me"
+          YAML
+    verify:
+      - id: owner-kind
+        desc: You identified what owns a ReplicaSet
+        points: 25
+        hint: "kubectl -n gc get rs -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}'"
+        run: |
+          eq "$(jp cm gcinfo '{.data.rs_owner_kind}' -n gc | tr -d ' ')" "Deployment"
+      - id: deployment-gone
+        desc: Deployment orphan-demo has been deleted
+        points: 20
+        hint: "kubectl -n gc delete deploy orphan-demo --cascade=orphan"
+        run: |
+          ! kubectl -n gc get deploy orphan-demo >/dev/null 2>&1
+      - id: orphans-survive
+        desc: Its ReplicaSet and pods survived as orphans
+        points: 30
+        hint: "--cascade=orphan strips the ownerReference instead of deleting the children"
+        run: |
+          n=$(kubectl -n gc get rs -l app=orphan-demo --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          [ "${n:-0}" -ge 1 ] || exit 1
+          p=$(ready_pods gc "app=orphan-demo")
+          [ "${p:-0}" -ge 2 ]
+      - id: finalizer-removed
+        desc: The stuck ConfigMap is finally gone
+        points: 25
+        hint: "kubectl -n gc patch cm stuck -p '{\"metadata\":{\"finalizers\":null}}' --type=merge"
+        run: |
+          ! kubectl -n gc get cm stuck >/dev/null 2>&1
+    hints:
+      - title: Reading ownerReferences
+        cost: 10
+        text: |
+          ```
+          kubectl -n gc get rs -o yaml | grep -A6 ownerReferences
+          kubectl -n gc get pods -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}'
+          ```
+          Pods are owned by a ReplicaSet, which is owned by a Deployment.
+          The chain is what makes a single delete clean up everything.
+      - title: The cascade modes
+        cost: 10
+        text: |
+          ```
+          kubectl delete deploy X                     # background (default)
+          kubectl delete deploy X --cascade=foreground # children go first, then the parent
+          kubectl delete deploy X --cascade=orphan     # children survive
+          ```
+          Orphaning is genuinely useful when you want to replace a
+          controller without restarting the workload it manages.
+      - title: Clearing a finalizer
+        cost: 12
+        text: |
+          A finalizer is a string in `metadata.finalizers`. The API server
+          refuses to complete a delete while any remain - it just sets
+          `deletionTimestamp` and waits for whoever owns that finalizer to
+          remove it. If that controller is gone, nothing ever will:
+
+          ```
+          kubectl -n gc patch cm stuck --type=merge -p '{"metadata":{"finalizers":null}}'
+          ```
+          This is exactly the fix for a namespace stuck in `Terminating` -
+          find the object holding a finalizer and clear it.
+    solution: |
+      ```bash
+      kubectl -n gc get rs -o yaml | grep -A6 ownerReferences
+      kubectl -n gc create configmap gcinfo --from-literal=rs_owner_kind=Deployment
+
+      kubectl -n gc delete deploy orphan-demo --cascade=orphan
+      kubectl -n gc get rs,pods            # still there
+
+      kubectl -n gc delete cm stuck --wait=false          # hangs, Terminating
+      kubectl -n gc patch cm stuck --type=merge -p '{"metadata":{"finalizers":null}}'
+      kubectl -n gc get cm stuck                           # gone
+      ```
+    solve_script: |
+      kubectl -n gc create configmap gcinfo --from-literal=rs_owner_kind=Deployment
+      kubectl -n gc delete deploy orphan-demo --cascade=orphan
+      kubectl -n gc patch cm stuck --type=merge -p '{"metadata":{"finalizers":null}}'
+      kubectl -n gc delete cm stuck --ignore-not-found --wait=false
+      sleep 8

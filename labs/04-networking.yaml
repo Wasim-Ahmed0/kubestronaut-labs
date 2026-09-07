@@ -1,0 +1,1083 @@
+category: Services & Networking
+labs:
+
+  - id: net-services-basics
+    title: ClusterIP, NodePort and the selector that ties them together
+    difficulty: easy
+    exams: [KCNA, CKA, CKAD]
+    concepts: [services, clusterip, nodeport, endpoints, selectors]
+    par_minutes: 10
+    estimated_minutes: 14
+    blurb: Expose a Deployment three ways and prove traffic actually lands.
+    scenario: |
+      A Service is a stable virtual IP plus a label selector. The selector
+      finds pods, kube-proxy programs the rules, and the EndpointSlice is
+      the visible proof it worked.
+
+      Expose the `web` Deployment internally and externally, then confirm
+      requests really reach a pod - not just that the object exists.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/service/
+    tasks:
+      - text: "Create a ClusterIP Service `web` in `netlab` on port 80 targeting port 80 of pods labelled `app=web`."
+      - text: "Create a NodePort Service `web-np` in `netlab` on port 80, fixed to node port 30080."
+      - text: "Both Services must have non-empty endpoints."
+      - text: "From a pod inside the cluster, an HTTP GET of `http://web.netlab.svc.cluster.local` must return 200. Save the response body to a ConfigMap `probe-result` in `netlab` under key `status` with the value `ok`."
+    setup:
+      - kind: shell
+        desc: deploy a web app with no Service
+        run: |
+          kubectl create ns netlab
+          kubectl -n netlab create deployment web --image=nginx:1.27-alpine --replicas=2
+          kubectl -n netlab rollout status deploy/web --timeout=180s
+    verify:
+      - id: clusterip
+        desc: Service netlab/web is a ClusterIP on port 80
+        points: 20
+        hint: "kubectl -n netlab expose deploy web --name=web --port=80 --target-port=80"
+        run: |
+          eq "$(jp svc web '{.spec.type}' -n netlab)" "ClusterIP" || exit 1
+          eq "$(jp svc web '{.spec.ports[0].port}' -n netlab)" "80"
+      - id: nodeport
+        desc: Service netlab/web-np is a NodePort on 30080
+        points: 25
+        hint: "expose with --type=NodePort, then patch spec.ports[0].nodePort to 30080"
+        run: |
+          eq "$(jp svc web-np '{.spec.type}' -n netlab)" "NodePort" || exit 1
+          eq "$(jp svc web-np '{.spec.ports[0].nodePort}' -n netlab)" "30080"
+      - id: endpoints
+        desc: Both Services have real endpoints behind them
+        points: 25
+        hint: "kubectl -n netlab get endpointslices -- empty means your selector does not match any pod"
+        run: |
+          for s in web web-np; do
+            RETRY=20 retry bash -c "kubectl -n netlab get endpointslices -l kubernetes.io/service-name=$s \
+              -o jsonpath='{.items[*].endpoints[*].addresses[*]}' | grep -q ."
+          done
+      - id: reachable
+        desc: The ConfigMap records a successful in-cluster request
+        points: 30
+        hint: "kubectl -n netlab run curl --rm -it --image=curlimages/curl:8.10.1 --restart=Never -- -s -o /dev/null -w '%{http_code}' http://web"
+        run: |
+          eq "$(jp cm probe-result '{.data.status}' -n netlab | tr -d ' ')" "ok" || exit 1
+          # and prove it independently, so the ConfigMap is not just a claim
+          kubectl -n netlab run klabcurl --rm -i --restart=Never --quiet \
+            --image=curlimages/curl:8.10.1 --command -- \
+            curl -sf -o /dev/null http://web.netlab.svc.cluster.local
+    hints:
+      - title: Exposing a Deployment
+        cost: 8
+        text: |
+          ```
+          kubectl -n netlab expose deployment web --name=web --port=80 --target-port=80
+          kubectl -n netlab expose deployment web --name=web-np --port=80 --type=NodePort
+          ```
+          `expose` copies the Deployment's selector for you.
+      - title: Pinning the node port
+        cost: 8
+        text: |
+          NodePort picks a random port in 30000-32767 unless you ask:
+
+          ```
+          kubectl -n netlab patch svc web-np -p '{"spec":{"ports":[{"port":80,"nodePort":30080}]}}'
+          ```
+      - title: Testing from inside the cluster
+        cost: 10
+        text: |
+          ```
+          kubectl -n netlab run curl --rm -it --restart=Never \
+            --image=curlimages/curl:8.10.1 -- -s http://web
+          ```
+          If it hangs, check endpoints first:
+          `kubectl -n netlab get endpointslices`. No endpoints almost always
+          means the Service selector does not match the pod labels.
+    solution: |
+      ```bash
+      kubectl -n netlab expose deployment web --name=web --port=80 --target-port=80
+      kubectl -n netlab expose deployment web --name=web-np --port=80 --type=NodePort
+      kubectl -n netlab patch svc web-np -p '{"spec":{"ports":[{"port":80,"nodePort":30080}]}}'
+
+      kubectl -n netlab run curl --rm -it --restart=Never \
+        --image=curlimages/curl:8.10.1 -- -sf http://web.netlab.svc.cluster.local
+
+      kubectl -n netlab create configmap probe-result --from-literal=status=ok
+      ```
+    solve_script: |
+      kubectl -n netlab expose deployment web --name=web --port=80 --target-port=80
+      kubectl -n netlab expose deployment web --name=web-np --port=80 --type=NodePort
+      kubectl -n netlab patch svc web-np -p '{"spec":{"ports":[{"port":80,"nodePort":30080}]}}'
+      kubectl -n netlab create configmap probe-result --from-literal=status=ok
+
+  - id: net-service-types
+    title: ExternalName, sessionAffinity and multi-port Services
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [services, externalname, session affinity, multi-port]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: The Service features that show up once you are past hello-world.
+    scenario: |
+      Three requirements from three different teams:
+
+      - Legacy code hardcodes `legacy-db.svcs.svc.cluster.local`, but the
+        database now lives outside the cluster at `db.example.com`.
+      - A stateful web app needs requests from the same client IP to land on
+        the same pod.
+      - A single app serves HTTP on 8080 and metrics on 9090, and both need
+        exposing through one Service.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/service/#externalname
+      - https://kubernetes.io/docs/reference/networking/virtual-ips/#session-affinity
+    tasks:
+      - text: "Create an ExternalName Service `legacy-db` in `svcs` pointing at `db.example.com`."
+      - text: "Create a ClusterIP Service `sticky` in `svcs` for pods labelled `app=multi`, port 80 to targetPort 8080, with `sessionAffinity: ClientIP`."
+      - text: "Create a ClusterIP Service `multi` in `svcs` exposing two named ports: `http` 80 to 8080, and `metrics` 9090 to 9090."
+    setup:
+      - kind: shell
+        desc: deploy a two-port app
+        run: |
+          kubectl create ns svcs
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: multi, namespace: svcs}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels: {app: multi}
+            template:
+              metadata:
+                labels: {app: multi}
+              spec:
+                containers:
+                  - name: web
+                    image: nginxinc/nginx-unprivileged:1.27-alpine
+                    ports:
+                      - {containerPort: 8080, name: http}
+                      - {containerPort: 9090, name: metrics}
+          YAML
+          kubectl -n svcs rollout status deploy/multi --timeout=180s
+    verify:
+      - id: externalname
+        desc: svcs/legacy-db is an ExternalName pointing at db.example.com
+        points: 30
+        hint: "kubectl -n svcs create service externalname legacy-db --external-name=db.example.com"
+        run: |
+          eq "$(jp svc legacy-db '{.spec.type}' -n svcs)" "ExternalName" || exit 1
+          eq "$(jp svc legacy-db '{.spec.externalName}' -n svcs)" "db.example.com"
+      - id: affinity
+        desc: svcs/sticky uses ClientIP session affinity and targets 8080
+        points: 35
+        hint: "spec.sessionAffinity: ClientIP"
+        run: |
+          eq "$(jp svc sticky '{.spec.sessionAffinity}' -n svcs)" "ClientIP" || exit 1
+          eq "$(jp svc sticky '{.spec.ports[0].targetPort}' -n svcs)" "8080" || exit 1
+          eq "$(jp svc sticky '{.spec.selector.app}' -n svcs)" "multi"
+      - id: multiport
+        desc: svcs/multi exposes named ports http and metrics
+        points: 35
+        hint: "a multi-port Service must name every port"
+        run: |
+          names=$(jp svc multi '{.spec.ports[*].name}' -n svcs | tr ' ' '\n' | sort | tr '\n' ' ')
+          eq "$names" "http metrics " || exit 1
+          eq "$(jp svc multi '{.spec.ports[?(@.name=="http")].port}' -n svcs)" "80" || exit 1
+          eq "$(jp svc multi '{.spec.ports[?(@.name=="metrics")].port}' -n svcs)" "9090"
+    hints:
+      - title: ExternalName is pure DNS
+        cost: 8
+        text: |
+          ```
+          kubectl -n svcs create service externalname legacy-db --external-name=db.example.com
+          ```
+          It creates a CNAME record and nothing else - no proxying, no
+          endpoints, no port translation.
+      - title: Session affinity
+        cost: 8
+        text: |
+          ```
+          kubectl -n svcs create service clusterip sticky --tcp=80:8080
+          kubectl -n svcs patch svc sticky -p \
+            '{"spec":{"selector":{"app":"multi"},"sessionAffinity":"ClientIP"}}'
+          ```
+          `kubectl create service` does not set a selector for you - patch it in.
+      - title: Naming ports
+        cost: 10
+        text: |
+          Once a Service has more than one port, every port needs a `name`:
+
+          ```
+          kubectl -n svcs create service clusterip multi --tcp=80:8080 --tcp=9090:9090
+          ```
+          That auto-names them `80-8080` and `9090-9090`, so patch the names
+          to `http` and `metrics`, and add the selector.
+    solution: |
+      ```bash
+      kubectl -n svcs create service externalname legacy-db --external-name=db.example.com
+
+      kubectl -n svcs create service clusterip sticky --tcp=80:8080
+      kubectl -n svcs patch svc sticky -p \
+        '{"spec":{"selector":{"app":"multi"},"sessionAffinity":"ClientIP"}}'
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Service
+      metadata: {name: multi, namespace: svcs}
+      spec:
+        selector: {app: multi}
+        ports:
+          - {name: http, port: 80, targetPort: 8080}
+          - {name: metrics, port: 9090, targetPort: 9090}
+      YAML
+      ```
+    solve_script: |
+      kubectl -n svcs create service externalname legacy-db --external-name=db.example.com
+      kubectl -n svcs create service clusterip sticky --tcp=80:8080
+      kubectl -n svcs patch svc sticky -p '{"spec":{"selector":{"app":"multi"},"sessionAffinity":"ClientIP"}}'
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Service
+      metadata: {name: multi, namespace: svcs}
+      spec:
+        selector: {app: multi}
+        ports:
+          - {name: http, port: 80, targetPort: 8080}
+          - {name: metrics, port: 9090, targetPort: 9090}
+      YAML
+  - id: net-dns
+    title: Cluster DNS - names, search domains and headless records
+    difficulty: medium
+    exams: [KCNA, CKA, CKAD]
+    concepts: [coredns, dns, service discovery, headless services]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: Learn the naming scheme so you never guess a Service address again.
+    scenario: |
+      Every Service gets an A record at
+      `<service>.<namespace>.svc.cluster.local`, and every pod's
+      `/etc/resolv.conf` has a search list that makes shorter names work
+      inside the same namespace.
+
+      Headless Services (clusterIP: None) are different: instead of one
+      virtual IP, DNS returns one record per pod, plus per-pod names for
+      StatefulSets.
+
+      Prove you understand both, and record the answers.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/
+    tasks:
+      - text: "In namespace `dnslab`, create a Deployment `api` (2 replicas, `nginx:1.27-alpine`) and a normal ClusterIP Service `api` on port 80."
+      - text: "Create a headless Service `api-headless` on port 80 selecting the same pods."
+      - text: "Record in ConfigMap `dnsanswers` in `dnslab`: key `fqdn` = the full DNS name of the `api` Service."
+      - text: "Key `headless_count` = how many A records `api-headless` resolves to."
+      - text: "Key `nameserver` = the IP address in a pod's /etc/resolv.conf nameserver line."
+    setup:
+      - kind: shell
+        desc: create the dnslab namespace
+        run: kubectl create ns dnslab
+    verify:
+      - id: services
+        desc: Both Services exist, one normal and one headless
+        points: 25
+        hint: "clusterIP: None makes a Service headless"
+        run: |
+          jp svc api '{.spec.clusterIP}' -n dnslab | grep -qv '^None$' || exit 1
+          jp svc api '{.spec.clusterIP}' -n dnslab | grep -q '[0-9]' || exit 1
+          eq "$(jp svc api-headless '{.spec.clusterIP}' -n dnslab)" "None"
+      - id: fqdn
+        desc: The recorded FQDN is correct
+        points: 25
+        hint: "<service>.<namespace>.svc.cluster.local"
+        run: |
+          got=$(jp cm dnsanswers '{.data.fqdn}' -n dnslab | tr -d ' ' | sed 's:\.$::')
+          eq "$got" "api.dnslab.svc.cluster.local"
+      - id: headless-count
+        desc: The headless record count matches the number of ready pods
+        points: 25
+        hint: "a headless Service returns one A record per ready pod"
+        run: |
+          want=$(kubectl -n dnslab get endpointslices -l kubernetes.io/service-name=api-headless \
+            -o jsonpath='{.items[*].endpoints[*].addresses[*]}' | wc -w | tr -d ' ')
+          got=$(jp cm dnsanswers '{.data.headless_count}' -n dnslab | tr -d ' ')
+          [ "$want" -gt 0 ] && eq "$got" "$want"
+      - id: nameserver
+        desc: The recorded nameserver is the real cluster DNS IP
+        points: 25
+        hint: "kubectl -n kube-system get svc kube-dns"
+        run: |
+          want=$(kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}')
+          got=$(jp cm dnsanswers '{.data.nameserver}' -n dnslab | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+    hints:
+      - title: Looking at resolv.conf
+        cost: 8
+        text: |
+          ```
+          kubectl -n dnslab run shell --rm -it --restart=Never \
+            --image=busybox:1.36 -- cat /etc/resolv.conf
+          ```
+          You will see `nameserver <kube-dns ip>` and a `search` line listing
+          `dnslab.svc.cluster.local svc.cluster.local cluster.local`. That
+          search list is why `api` alone works from inside `dnslab`.
+      - title: Counting headless records
+        cost: 10
+        text: |
+          ```
+          kubectl -n dnslab run shell --rm -it --restart=Never --image=busybox:1.36 \
+            -- nslookup api-headless.dnslab.svc.cluster.local
+          ```
+          Count the `Address:` lines after the server line. It should equal
+          the number of ready pods - two here.
+      - title: Finding the DNS service IP
+        cost: 8
+        text: |
+          ```
+          kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}'
+          ```
+          The Service is called `kube-dns` even when CoreDNS is what is
+          running behind it - kept for backwards compatibility.
+    solution: |
+      ```bash
+      kubectl -n dnslab create deployment api --image=nginx:1.27-alpine --replicas=2
+      kubectl -n dnslab expose deployment api --port=80
+
+      kubectl -n dnslab create service clusterip api-headless --clusterip=None --tcp=80:80
+      kubectl -n dnslab patch svc api-headless -p '{"spec":{"selector":{"app":"api"}}}'
+
+      DNSIP=$(kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}')
+
+      kubectl -n dnslab create configmap dnsanswers \
+        --from-literal=fqdn=api.dnslab.svc.cluster.local \
+        --from-literal=headless_count=2 \
+        --from-literal=nameserver=$DNSIP
+      ```
+    solve_script: |
+      kubectl -n dnslab create deployment api --image=nginx:1.27-alpine --replicas=2
+      kubectl -n dnslab rollout status deploy/api --timeout=180s
+      kubectl -n dnslab expose deployment api --port=80
+      kubectl -n dnslab create service clusterip api-headless --clusterip=None --tcp=80:80
+      kubectl -n dnslab patch svc api-headless -p '{"spec":{"selector":{"app":"api"}}}'
+      sleep 8
+      DNSIP=$(kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}')
+      N=$(kubectl -n dnslab get endpointslices -l kubernetes.io/service-name=api-headless \
+        -o jsonpath='{.items[*].endpoints[*].addresses[*]}' | wc -w | tr -d ' ')
+      kubectl -n dnslab create configmap dnsanswers \
+        --from-literal=fqdn=api.dnslab.svc.cluster.local \
+        --from-literal=headless_count=$N \
+        --from-literal=nameserver=$DNSIP
+
+  - id: net-service-broken
+    title: Troubleshoot a Service with no endpoints
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [services, endpoints, selectors, troubleshooting, targetPort]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: Three classic Service faults, all in one namespace. Find and fix them.
+    scenario: |
+      The `storefront` namespace has three Services that users cannot reach.
+      Each one is broken in a different, very common way:
+
+      - `svc-a` selects labels that no pod has
+      - `svc-b` points at the wrong `targetPort`
+      - `svc-c` uses the wrong protocol
+
+      The pods themselves are healthy and serving HTTP on container port
+      8080. Fix the Services without touching the Deployment.
+    docs:
+      - https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/
+    tasks:
+      - text: "Make all three Services in `storefront` route correctly to the `shop` pods."
+      - text: "Do not modify the Deployment - the pods are correct as they are."
+      - text: "Each Service must end up with endpoints and answer HTTP 200 on its own port 80."
+    setup:
+      - kind: shell
+        desc: deploy healthy pods behind three broken Services
+        run: |
+          kubectl create ns storefront
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: shop, namespace: storefront}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels: {app: shop}
+            template:
+              metadata:
+                labels: {app: shop}
+              spec:
+                containers:
+                  - name: web
+                    image: nginxinc/nginx-unprivileged:1.27-alpine
+                    ports: [{containerPort: 8080}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: svc-a, namespace: storefront}
+          spec:
+            selector: {app: storefront}
+            ports: [{port: 80, targetPort: 8080}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: svc-b, namespace: storefront}
+          spec:
+            selector: {app: shop}
+            ports: [{port: 80, targetPort: 80}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: svc-c, namespace: storefront}
+          spec:
+            selector: {app: shop}
+            ports: [{port: 80, targetPort: 8080, protocol: UDP}]
+          YAML
+          kubectl -n storefront rollout status deploy/shop --timeout=180s
+    verify:
+      - id: a
+        desc: svc-a selects the shop pods and has endpoints
+        points: 25
+        hint: "compare kubectl -n storefront get svc svc-a -o yaml with the pod labels"
+        run: |
+          eq "$(jp svc svc-a '{.spec.selector.app}' -n storefront)" "shop" || exit 1
+          RETRY=20 retry bash -c "kubectl -n storefront get endpointslices \
+            -l kubernetes.io/service-name=svc-a -o jsonpath='{.items[*].endpoints[*].addresses[*]}' | grep -q ."
+      - id: b
+        desc: svc-b targets container port 8080
+        points: 25
+        hint: "the container listens on 8080, so targetPort must be 8080"
+        run: |
+          eq "$(jp svc svc-b '{.spec.ports[0].targetPort}' -n storefront)" "8080"
+      - id: c
+        desc: svc-c uses TCP
+        points: 25
+        hint: "HTTP is TCP -- a UDP Service will never answer"
+        run: |
+          eq "$(jp svc svc-c '{.spec.ports[0].protocol}' -n storefront)" "TCP"
+      - id: reachable
+        desc: All three Services answer HTTP 200 from inside the cluster
+        points: 25
+        hint: "kubectl -n storefront run curl --rm -it --image=curlimages/curl:8.10.1 --restart=Never -- -sf http://svc-a"
+        run: |
+          RETRY=15 retry bash -c 'kubectl -n storefront run klabcurl --rm -i --restart=Never --quiet \
+            --image=curlimages/curl:8.10.1 --command -- \
+            sh -c "curl -sf -o /dev/null http://svc-a && curl -sf -o /dev/null http://svc-b && curl -sf -o /dev/null http://svc-c"'
+      - id: untouched
+        desc: The shop Deployment was not modified
+        points: 0
+        hint: "fix the Services, not the workload"
+        run: |
+          eq "$(jp deploy shop '{.spec.template.spec.containers[0].ports[0].containerPort}' -n storefront)" "8080" || exit 1
+          eq "$(jp deploy shop '{.spec.template.metadata.labels.app}' -n storefront)" "shop"
+    hints:
+      - title: The one command that finds all three
+        cost: 8
+        text: |
+          ```
+          kubectl -n storefront get endpointslices
+          ```
+          A Service with no endpoints has a selector problem. A Service with
+          endpoints that still does not answer has a port or protocol
+          problem. That split narrows it down instantly.
+      - title: What the pods actually look like
+        cost: 8
+        text: |
+          ```
+          kubectl -n storefront get pods --show-labels
+          kubectl -n storefront get pods -o jsonpath='{.items[0].spec.containers[0].ports}'
+          ```
+          The image is `nginx-unprivileged`, which listens on 8080, not 80.
+      - title: Patching each Service
+        cost: 12
+        text: |
+          ```
+          kubectl -n storefront patch svc svc-a -p '{"spec":{"selector":{"app":"shop"}}}'
+          kubectl -n storefront patch svc svc-b -p '{"spec":{"ports":[{"port":80,"targetPort":8080}]}}'
+          kubectl -n storefront patch svc svc-c -p '{"spec":{"ports":[{"port":80,"targetPort":8080,"protocol":"TCP"}]}}'
+          ```
+    solution: |
+      ```bash
+      kubectl -n storefront get endpointslices          # svc-a has none
+
+      kubectl -n storefront patch svc svc-a -p '{"spec":{"selector":{"app":"shop"}}}'
+      kubectl -n storefront patch svc svc-b -p '{"spec":{"ports":[{"port":80,"targetPort":8080}]}}'
+      kubectl -n storefront patch svc svc-c -p '{"spec":{"ports":[{"port":80,"targetPort":8080,"protocol":"TCP"}]}}'
+
+      kubectl -n storefront run curl --rm -it --restart=Never \
+        --image=curlimages/curl:8.10.1 -- -sf http://svc-a
+      ```
+    solve_script: |
+      kubectl -n storefront patch svc svc-a -p '{"spec":{"selector":{"app":"shop"}}}'
+      kubectl -n storefront patch svc svc-b -p '{"spec":{"ports":[{"port":80,"targetPort":8080}]}}'
+      kubectl -n storefront patch svc svc-c -p '{"spec":{"ports":[{"port":80,"targetPort":8080,"protocol":"TCP"}]}}'
+      sleep 5
+
+  - id: net-ingress
+    title: Ingress - route two hostnames to two backends
+    difficulty: hard
+    exams: [CKA, CKAD]
+    concepts: [ingress, ingress controller, path routing, host routing]
+    par_minutes: 16
+    estimated_minutes: 22
+    cluster:
+      kind_nodes: |
+        - role: control-plane
+          kubeadmConfigPatches:
+            - |
+              kind: InitConfiguration
+              nodeRegistration:
+                kubeletExtraArgs:
+                  node-labels: "ingress-ready=true"
+          extraPortMappings:
+            - containerPort: 80
+              hostPort: 8080
+              protocol: TCP
+      install:
+        - name: ingress-nginx
+          timeout: 420
+          run: |
+            kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.3/deploy/static/provider/kind/deploy.yaml
+            kubectl -n ingress-nginx wait --for=condition=Available deploy/ingress-nginx-controller --timeout=300s
+            kubectl -n ingress-nginx wait --for=condition=Ready pod \
+              -l app.kubernetes.io/component=controller --timeout=300s
+    blurb: One controller, two hosts, one path-based rule - the standard L7 setup.
+    scenario: |
+      An ingress-nginx controller is already running in this cluster. Two
+      apps need to be published through it:
+
+      - `shop.example.com` must reach the `shop` Service
+      - `api.example.com/v1` must reach the `api` Service
+
+      An Ingress is only a set of rules - it does nothing without a
+      controller watching for it, and it needs an `ingressClassName` to say
+      which controller should pick it up.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/ingress/
+    tasks:
+      - text: "Create an Ingress `store` in `edge` with ingressClassName `nginx`."
+      - text: "Route host `shop.example.com`, path `/` (Prefix) to Service `shop` port 80."
+      - text: "Route host `api.example.com`, path `/v1` (Prefix) to Service `api` port 80."
+      - text: "Both routes must actually serve traffic through the controller."
+    setup:
+      - kind: shell
+        desc: deploy two backends and their Services
+        run: |
+          kubectl create ns edge
+          kubectl -n edge create deployment shop --image=nginx:1.27-alpine
+          kubectl -n edge create deployment api --image=nginx:1.27-alpine
+          kubectl -n edge expose deployment shop --port=80
+          kubectl -n edge expose deployment api --port=80
+          kubectl -n edge rollout status deploy/shop --timeout=180s
+          kubectl -n edge rollout status deploy/api --timeout=180s
+    verify:
+      - id: ingress
+        desc: Ingress edge/store exists with ingressClassName nginx
+        points: 20
+        hint: "spec.ingressClassName: nginx"
+        run: |
+          eq "$(jp ing store '{.spec.ingressClassName}' -n edge)" "nginx"
+      - id: shop-rule
+        desc: shop.example.com routes to the shop Service on port 80
+        points: 25
+        hint: "kubectl -n edge create ingress store --rule='shop.example.com/*=shop:80'"
+        run: |
+          h=$(jp ing store '{.spec.rules[?(@.host=="shop.example.com")].http.paths[0].backend.service.name}' -n edge)
+          eq "$h" "shop"
+      - id: api-rule
+        desc: api.example.com/v1 routes to the api Service on port 80
+        points: 25
+        hint: "a second --rule='api.example.com/v1*=api:80'"
+        run: |
+          n=$(jp ing store '{.spec.rules[?(@.host=="api.example.com")].http.paths[0].backend.service.name}' -n edge)
+          p=$(jp ing store '{.spec.rules[?(@.host=="api.example.com")].http.paths[0].path}' -n edge)
+          eq "$n" "api" && echo "$p" | grep -q '^/v1'
+      - id: serving
+        desc: The controller actually serves both hosts
+        points: 30
+        hint: "curl -H 'Host: shop.example.com' http://<controller>/ from inside the cluster"
+        run: |
+          RETRY=30 retry bash -c 'kubectl -n edge run klabcurl --rm -i --restart=Never --quiet \
+            --image=curlimages/curl:8.10.1 --command -- sh -c "
+              curl -sf -o /dev/null -H \"Host: shop.example.com\" http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/ &&
+              curl -sf -o /dev/null -H \"Host: api.example.com\" http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/v1"'
+    hints:
+      - title: The imperative generator
+        cost: 10
+        text: |
+          ```
+          kubectl -n edge create ingress store \
+            --class=nginx \
+            --rule="shop.example.com/*=shop:80" \
+            --rule="api.example.com/v1*=api:80"
+          ```
+          The trailing `*` in the rule is what makes the pathType `Prefix`.
+      - title: Testing without DNS
+        cost: 10
+        text: |
+          You do not need real DNS - send the Host header yourself:
+
+          ```
+          kubectl -n edge run curl --rm -it --restart=Never --image=curlimages/curl:8.10.1 -- \
+            -H 'Host: shop.example.com' \
+            http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/
+          ```
+      - title: When the Ingress does nothing
+        cost: 12
+        text: |
+          Check in order:
+          1. `kubectl get ingressclass` - does `nginx` exist?
+          2. `kubectl -n edge describe ing store` - the events say if it was accepted
+          3. `kubectl -n edge get svc shop` - does the backend Service have endpoints?
+
+          An Ingress with no `ingressClassName` and no default class is
+          silently ignored.
+    solution: |
+      ```bash
+      kubectl -n edge create ingress store \
+        --class=nginx \
+        --rule="shop.example.com/*=shop:80" \
+        --rule="api.example.com/v1*=api:80"
+
+      kubectl -n edge describe ing store
+
+      kubectl -n edge run curl --rm -it --restart=Never --image=curlimages/curl:8.10.1 -- \
+        -sf -H 'Host: shop.example.com' \
+        http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/
+      ```
+    solve_script: |
+      kubectl -n edge create ingress store --class=nginx \
+        --rule="shop.example.com/*=shop:80" \
+        --rule="api.example.com/v1*=api:80"
+      sleep 20
+
+  - id: net-networkpolicy-deny
+    title: Default deny, then allow only what you meant to
+    difficulty: hard
+    exams: [CKA, CKS, KCSA]
+    concepts: [networkpolicy, zero trust, ingress rules, namespace isolation]
+    par_minutes: 18
+    estimated_minutes: 24
+    cluster:
+      nodes: 1
+      cni: calico
+    blurb: Real enforcement - this cluster runs Calico, so a wrong policy really blocks traffic.
+    scenario: |
+      The `secure` namespace runs three pods: `frontend`, `backend` and
+      `attacker`. Right now every pod can talk to every other pod, which is
+      the Kubernetes default and is exactly what an attacker wants after a
+      first foothold.
+
+      Lock it down properly:
+
+      1. A default-deny ingress policy for the whole namespace
+      2. One targeted policy that lets `frontend` reach `backend` on TCP 80
+      3. Nothing else gets through - `attacker` must be blocked
+
+      This cluster runs Calico, so NetworkPolicy is genuinely enforced.
+      A policy that looks right but selects the wrong pods will fail the
+      connectivity checks.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/network-policies/
+    tasks:
+      - text: "Create a NetworkPolicy `default-deny` in `secure` that denies all ingress to every pod in the namespace."
+      - text: "Create a NetworkPolicy `allow-frontend` that allows ingress to pods labelled `app=backend` from pods labelled `app=frontend`, on TCP port 80 only."
+      - text: "`frontend` must still be able to reach `backend`."
+      - text: "`attacker` must NOT be able to reach `backend`."
+    setup:
+      - kind: shell
+        desc: create three pods with no isolation
+        run: |
+          kubectl create ns secure
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: backend, namespace: secure, labels: {app: backend}}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+                ports: [{containerPort: 80}]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: frontend, namespace: secure, labels: {app: frontend}}
+          spec:
+            containers:
+              - name: c
+                image: curlimages/curl:8.10.1
+                command: ["sleep", "86400"]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: attacker, namespace: secure, labels: {app: attacker}}
+          spec:
+            containers:
+              - name: c
+                image: curlimages/curl:8.10.1
+                command: ["sleep", "86400"]
+          YAML
+          kubectl -n secure wait --for=condition=Ready pod --all --timeout=240s
+    verify:
+      - id: deny-policy
+        desc: A default-deny ingress policy covers every pod in the namespace
+        points: 25
+        hint: "podSelector: {} with policyTypes: [Ingress] and no ingress rules"
+        run: |
+          sel=$(jp netpol default-deny '{.spec.podSelector}' -n secure)
+          eq "$sel" "{}" || exit 1
+          jp netpol default-deny '{.spec.policyTypes[*]}' -n secure | grep -q Ingress || exit 1
+          # no ingress rules at all == deny
+          rules=$(jp netpol default-deny '{.spec.ingress}' -n secure)
+          [ -z "$rules" ] || [ "$rules" = "[]" ]
+      - id: allow-policy
+        desc: allow-frontend permits app=frontend to reach app=backend on TCP 80
+        points: 25
+        hint: "podSelector picks the destination; ingress.from.podSelector picks the source"
+        run: |
+          eq "$(jp netpol allow-frontend '{.spec.podSelector.matchLabels.app}' -n secure)" "backend" || exit 1
+          eq "$(jp netpol allow-frontend '{.spec.ingress[0].from[0].podSelector.matchLabels.app}' -n secure)" "frontend" || exit 1
+          eq "$(jp netpol allow-frontend '{.spec.ingress[0].ports[0].port}' -n secure)" "80"
+      - id: frontend-allowed
+        desc: frontend can still reach backend
+        points: 25
+        hint: "kubectl -n secure exec frontend -- curl -s --max-time 5 backend-ip"
+        run: |
+          ip=$(jp pod backend '{.status.podIP}' -n secure)
+          [ -n "$ip" ] || exit 1
+          RETRY=10 retry kubectl -n secure exec frontend -- curl -sf --max-time 5 -o /dev/null "http://$ip"
+      - id: attacker-blocked
+        desc: attacker is blocked from backend
+        points: 25
+        hint: "if this fails, your allow policy is too broad -- check the from selector"
+        run: |
+          ip=$(jp pod backend '{.status.podIP}' -n secure)
+          [ -n "$ip" ] || exit 1
+          if kubectl -n secure exec attacker -- curl -sf --max-time 5 -o /dev/null "http://$ip" 2>/dev/null; then
+            echo "attacker could still reach backend" >&2
+            exit 1
+          fi
+          exit 0
+    hints:
+      - title: The default-deny shape
+        cost: 10
+        text: |
+          An empty `podSelector` means "every pod in this namespace", and a
+          policy with no rules for a listed policyType denies that direction:
+
+          ```yaml
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: secure}
+          spec:
+            podSelector: {}
+            policyTypes: ["Ingress"]
+          ```
+      - title: Policies are additive
+        cost: 10
+        text: |
+          You never "unblock" a deny policy - you add another policy that
+          allows something. If any policy selecting a pod allows the traffic,
+          it is allowed.
+
+          ```yaml
+          spec:
+            podSelector:
+              matchLabels: {app: backend}
+            policyTypes: ["Ingress"]
+            ingress:
+              - from:
+                  - podSelector:
+                      matchLabels: {app: frontend}
+                ports:
+                  - protocol: TCP
+                    port: 80
+          ```
+      - title: Watch the list indentation
+        cost: 12
+        text: |
+          This is the classic mistake:
+
+          ```yaml
+          from:
+            - podSelector: {...}
+              namespaceSelector: {...}     # AND - same list item
+          ```
+          versus
+          ```yaml
+          from:
+            - podSelector: {...}
+            - namespaceSelector: {...}     # OR - two list items
+          ```
+          One dash means "pods matching both". Two dashes means "either".
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: default-deny, namespace: secure}
+      spec:
+        podSelector: {}
+        policyTypes: ["Ingress"]
+      ---
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: allow-frontend, namespace: secure}
+      spec:
+        podSelector:
+          matchLabels:
+            app: backend
+        policyTypes: ["Ingress"]
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels:
+                    app: frontend
+            ports:
+              - protocol: TCP
+                port: 80
+      YAML
+
+      BACKEND=$(kubectl -n secure get pod backend -o jsonpath='{.status.podIP}')
+      kubectl -n secure exec frontend -- curl -s --max-time 5 http://$BACKEND   # works
+      kubectl -n secure exec attacker -- curl -s --max-time 5 http://$BACKEND   # times out
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: default-deny, namespace: secure}
+      spec:
+        podSelector: {}
+        policyTypes: ["Ingress"]
+      ---
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: allow-frontend, namespace: secure}
+      spec:
+        podSelector:
+          matchLabels: {app: backend}
+        policyTypes: ["Ingress"]
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels: {app: frontend}
+            ports:
+              - protocol: TCP
+                port: 80
+      YAML
+      sleep 15
+
+  - id: net-networkpolicy-egress
+    title: Egress control and cross-namespace policy
+    difficulty: expert
+    exams: [CKS, CKA]
+    concepts: [networkpolicy, egress, namespaceSelector, dns, zero trust]
+    par_minutes: 20
+    estimated_minutes: 26
+    cluster:
+      nodes: 1
+      cni: calico
+    blurb: Lock down what a compromised pod can call out to - including DNS.
+    scenario: |
+      Ingress policy stops people getting in. Egress policy stops a
+      compromised workload phoning home, and it is the half most people get
+      wrong - usually by forgetting that blocking all egress also blocks
+      DNS, which breaks everything in a confusing way.
+
+      The `payments` namespace must be able to reach only:
+
+      - the `vault` Service in the `platform` namespace, on TCP 80
+      - cluster DNS (UDP 53) so it can resolve names at all
+
+      Everything else out of `payments` must be denied.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/network-policies/
+    tasks:
+      - text: "Label the `platform` namespace with `purpose=platform` so it can be selected."
+      - text: "Create a NetworkPolicy `restrict-egress` in `payments` applying to all pods, with policyTypes Egress."
+      - text: "Allow egress to pods labelled `app=vault` in the namespace labelled `purpose=platform`, on TCP 80."
+      - text: "Allow egress to UDP port 53 for DNS resolution."
+      - text: "The `client` pod in `payments` must reach vault, and must NOT reach the `public` Service in the `other` namespace."
+    setup:
+      - kind: shell
+        desc: build three namespaces with a client, a vault and an unrelated service
+        run: |
+          kubectl create ns payments
+          kubectl create ns platform
+          kubectl create ns other
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: client, namespace: payments, labels: {app: client}}
+          spec:
+            containers:
+              - name: c
+                image: curlimages/curl:8.10.1
+                command: ["sleep", "86400"]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: vault, namespace: platform, labels: {app: vault}}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+                ports: [{containerPort: 80}]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: public, namespace: other, labels: {app: public}}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+                ports: [{containerPort: 80}]
+          YAML
+          kubectl -n payments wait --for=condition=Ready pod/client --timeout=240s
+          kubectl -n platform wait --for=condition=Ready pod/vault --timeout=240s
+          kubectl -n other wait --for=condition=Ready pod/public --timeout=240s
+    verify:
+      - id: ns-label
+        desc: The platform namespace carries purpose=platform
+        points: 15
+        hint: "kubectl label ns platform purpose=platform"
+        run: |
+          eq "$(jp ns platform '{.metadata.labels.purpose}')" "platform"
+      - id: policy-shape
+        desc: restrict-egress applies Egress to every pod in payments
+        points: 20
+        hint: "podSelector: {} and policyTypes: [Egress]"
+        run: |
+          eq "$(jp netpol restrict-egress '{.spec.podSelector}' -n payments)" "{}" || exit 1
+          jp netpol restrict-egress '{.spec.policyTypes[*]}' -n payments | grep -q Egress
+      - id: dns-allowed
+        desc: DNS resolution still works from the client pod
+        points: 25
+        hint: "you need an egress rule allowing UDP 53 -- without it every name lookup fails"
+        run: |
+          RETRY=10 retry kubectl -n payments exec client -- \
+            nslookup vault.platform.svc.cluster.local
+      - id: vault-allowed
+        desc: The client can reach vault in the platform namespace
+        points: 20
+        hint: "namespaceSelector plus podSelector in the same from/to list item"
+        run: |
+          ip=$(jp pod vault '{.status.podIP}' -n platform)
+          [ -n "$ip" ] || exit 1
+          RETRY=10 retry kubectl -n payments exec client -- curl -sf --max-time 5 -o /dev/null "http://$ip"
+      - id: other-blocked
+        desc: The client cannot reach the pod in the other namespace
+        points: 20
+        hint: "if this passes, your egress rule is too broad"
+        run: |
+          ip=$(jp pod public '{.status.podIP}' -n other)
+          [ -n "$ip" ] || exit 1
+          if kubectl -n payments exec client -- curl -sf --max-time 5 -o /dev/null "http://$ip" 2>/dev/null; then
+            echo "client could still reach the other namespace" >&2
+            exit 1
+          fi
+          exit 0
+    hints:
+      - title: Do not forget DNS
+        cost: 10
+        text: |
+          The moment you add an Egress policy with any rule, everything not
+          listed is denied - including UDP 53 to CoreDNS. Add:
+
+          ```yaml
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+            ports:
+              - protocol: UDP
+                port: 53
+          ```
+          Every namespace automatically has the label
+          `kubernetes.io/metadata.name: <its own name>`, which is very handy.
+      - title: Selecting a pod in another namespace
+        cost: 12
+        text: |
+          Both selectors in a *single* list item means "pods matching this
+          label, in namespaces matching that label":
+
+          ```yaml
+          - to:
+              - namespaceSelector:
+                  matchLabels: {purpose: platform}
+                podSelector:
+                  matchLabels: {app: vault}
+            ports:
+              - protocol: TCP
+                port: 80
+          ```
+      - title: Debugging a policy that blocks too much
+        cost: 12
+        text: |
+          Test one thing at a time from inside the pod:
+
+          ```
+          kubectl -n payments exec client -- nslookup vault.platform
+          kubectl -n payments exec client -- curl -v --max-time 5 http://<vault-ip>
+          ```
+          A DNS timeout and a connection timeout look very different -
+          learn to tell them apart.
+    solution: |
+      ```bash
+      kubectl label ns platform purpose=platform
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: restrict-egress, namespace: payments}
+      spec:
+        podSelector: {}
+        policyTypes: ["Egress"]
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    purpose: platform
+                podSelector:
+                  matchLabels:
+                    app: vault
+            ports:
+              - protocol: TCP
+                port: 80
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+            ports:
+              - protocol: UDP
+                port: 53
+      YAML
+      ```
+    solve_script: |
+      kubectl label ns platform purpose=platform --overwrite
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: restrict-egress, namespace: payments}
+      spec:
+        podSelector: {}
+        policyTypes: ["Egress"]
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels: {purpose: platform}
+                podSelector:
+                  matchLabels: {app: vault}
+            ports:
+              - protocol: TCP
+                port: 80
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+            ports:
+              - protocol: UDP
+                port: 53
+      YAML
+      sleep 15
+

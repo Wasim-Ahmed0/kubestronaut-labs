@@ -1,0 +1,693 @@
+category: Application Design & Deployment Patterns
+labs:
+
+  - id: app-blue-green
+    title: Blue/green deployment with a Service selector switch
+    difficulty: medium
+    exams: [CKAD]
+    concepts: [blue-green, services, selectors, release strategy]
+    par_minutes: 13
+    estimated_minutes: 17
+    blurb: Two full versions, one Service, one instant cutover and an instant rollback.
+    scenario: |
+      Blue/green keeps two complete versions running and moves all traffic
+      at once by editing a Service selector. The cutover is atomic and the
+      rollback is the same edit in reverse - which is why it is the go-to
+      pattern for releases you do not trust.
+
+      The cost is running double capacity for the duration.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/service/
+    tasks:
+      - text: "In namespace `release`, Deployment `app-blue` already serves traffic through Service `app` (selector `app=web,version=blue`)."
+      - text: "Create Deployment `app-green`: 2 replicas, image `nginx:1.27-alpine`, pod labels `app=web` and `version=green`."
+      - text: "Wait until green is fully Ready, then switch the Service selector to `version=green`."
+      - text: "Leave `app-blue` running and untouched, so you could roll back instantly."
+    setup:
+      - kind: shell
+        desc: deploy the blue version behind a Service
+        run: |
+          kubectl create ns release
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: app-blue, namespace: release}
+          spec:
+            replicas: 2
+            selector: {matchLabels: {app: web, version: blue}}
+            template:
+              metadata: {labels: {app: web, version: blue}}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.25-alpine
+                    ports: [{containerPort: 80}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: app, namespace: release}
+          spec:
+            selector: {app: web, version: blue}
+            ports: [{port: 80, targetPort: 80}]
+          YAML
+          kubectl -n release rollout status deploy/app-blue --timeout=240s
+    verify:
+      - id: green-exists
+        desc: app-green runs 2 ready replicas of nginx:1.27-alpine
+        points: 30
+        hint: "pod labels must include app=web and version=green"
+        run: |
+          rollout release deploy/app-green 240s || exit 1
+          eq "$(jp deploy app-green '{.status.readyReplicas}' -n release)" "2" || exit 1
+          eq "$(jp deploy app-green '{.spec.template.spec.containers[0].image}' -n release)" "nginx:1.27-alpine" || exit 1
+          eq "$(jp deploy app-green '{.spec.template.metadata.labels.version}' -n release)" "green"
+      - id: switched
+        desc: The Service now selects version=green
+        points: 30
+        hint: "kubectl -n release patch svc app -p '{\"spec\":{\"selector\":{\"app\":\"web\",\"version\":\"green\"}}}'"
+        run: |
+          eq "$(jp svc app '{.spec.selector.version}' -n release)" "green" || exit 1
+          eq "$(jp svc app '{.spec.selector.app}' -n release)" "web"
+      - id: endpoints-green
+        desc: The Service's endpoints are all green pods
+        points: 25
+        hint: "kubectl -n release get endpointslices -l kubernetes.io/service-name=app -o yaml"
+        run: |
+          RETRY=20 retry bash -c '
+            ips=$(kubectl -n release get endpointslices -l kubernetes.io/service-name=app \
+              -o jsonpath="{.items[*].endpoints[*].addresses[*]}")
+            [ -n "$ips" ]' || exit 1
+          ips=$(kubectl -n release get endpointslices -l kubernetes.io/service-name=app \
+            -o jsonpath='{.items[*].endpoints[*].addresses[*]}')
+          for ip in $ips; do
+            kubectl -n release get pods -l version=green \
+              -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' | grep -qx "$ip" || exit 1
+          done
+          exit 0
+      - id: blue-intact
+        desc: app-blue is still running, ready for an instant rollback
+        points: 15
+        hint: "blue/green means keeping the old version around"
+        run: |
+          eq "$(jp deploy app-blue '{.status.readyReplicas}' -n release)" "2" || exit 1
+          eq "$(jp deploy app-blue '{.spec.template.spec.containers[0].image}' -n release)" "nginx:1.25-alpine"
+    hints:
+      - title: Building green from blue
+        cost: 8
+        text: |
+          ```
+          kubectl -n release get deploy app-blue -o yaml > green.yaml
+          ```
+          Then change the name to `app-green`, the image to
+          `nginx:1.27-alpine`, and `version: blue` to `version: green` in
+          both the selector and the template labels. Strip
+          `metadata.resourceVersion`, `uid`, `creationTimestamp` and
+          `status` before applying.
+      - title: The cutover
+        cost: 8
+        text: |
+          ```
+          kubectl -n release rollout status deploy/app-green   # WAIT for this
+          kubectl -n release patch svc app -p \
+            '{"spec":{"selector":{"app":"web","version":"green"}}}'
+          ```
+          Switching before green is Ready sends traffic to pods that are not
+          serving - the whole point of the pattern is to wait.
+      - title: Verifying the switch
+        cost: 8
+        text: |
+          ```
+          kubectl -n release get endpointslices -l kubernetes.io/service-name=app -o wide
+          kubectl -n release get pods -l version=green -o wide
+          ```
+          The endpoint addresses should all be green pod IPs.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: app-green, namespace: release}
+      spec:
+        replicas: 2
+        selector: {matchLabels: {app: web, version: green}}
+        template:
+          metadata: {labels: {app: web, version: green}}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+                ports: [{containerPort: 80}]
+      YAML
+
+      kubectl -n release rollout status deploy/app-green
+
+      kubectl -n release patch svc app -p \
+        '{"spec":{"selector":{"app":"web","version":"green"}}}'
+      ```
+      Rollback is the same command with `blue`.
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: app-green, namespace: release}
+      spec:
+        replicas: 2
+        selector: {matchLabels: {app: web, version: green}}
+        template:
+          metadata: {labels: {app: web, version: green}}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+                ports: [{containerPort: 80}]
+      YAML
+      kubectl -n release rollout status deploy/app-green --timeout=300s
+      kubectl -n release patch svc app -p '{"spec":{"selector":{"app":"web","version":"green"}}}'
+      sleep 8
+
+  - id: app-canary
+    title: Canary release by replica ratio
+    difficulty: medium
+    exams: [CKAD]
+    concepts: [canary, services, replicas, traffic splitting, release strategy]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: One Service, two Deployments, traffic split by how many pods each has.
+    scenario: |
+      Without a service mesh you can still do a decent canary: run two
+      Deployments whose pods share the label the Service selects, and
+      control the split with replica counts. Nine stable pods and one canary
+      pod is roughly 10% of traffic.
+
+      It is approximate - it is per-pod, not per-request - but it needs no
+      extra infrastructure and it is what CKAD asks for.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+    tasks:
+      - text: "In `canary`, Service `web` selects `app=web` and currently fronts Deployment `web-stable` (4 replicas, `nginx:1.25-alpine`)."
+      - text: "Create Deployment `web-canary`: 1 replica, `nginx:1.27-alpine`, pod labels `app=web` and `track=canary`."
+      - text: "Make sure `web-stable` pods carry `track=stable`."
+      - text: "The Service must end up with 5 endpoints - 4 stable and 1 canary - giving roughly a 20% canary share."
+    setup:
+      - kind: shell
+        desc: deploy the stable version behind a Service
+        run: |
+          kubectl create ns canary
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: web-stable, namespace: canary}
+          spec:
+            replicas: 4
+            selector: {matchLabels: {app: web, track: stable}}
+            template:
+              metadata: {labels: {app: web, track: stable}}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.25-alpine
+                    ports: [{containerPort: 80}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: web, namespace: canary}
+          spec:
+            selector: {app: web}
+            ports: [{port: 80, targetPort: 80}]
+          YAML
+          kubectl -n canary rollout status deploy/web-stable --timeout=240s
+    verify:
+      - id: canary-deploy
+        desc: web-canary runs 1 replica of nginx:1.27-alpine with track=canary
+        points: 30
+        hint: "its pods need app=web so the Service picks them up, plus track=canary to tell them apart"
+        run: |
+          rollout canary deploy/web-canary 240s || exit 1
+          eq "$(jp deploy web-canary '{.spec.replicas}' -n canary)" "1" || exit 1
+          eq "$(jp deploy web-canary '{.spec.template.spec.containers[0].image}' -n canary)" "nginx:1.27-alpine" || exit 1
+          eq "$(jp deploy web-canary '{.spec.template.metadata.labels.app}' -n canary)" "web" || exit 1
+          eq "$(jp deploy web-canary '{.spec.template.metadata.labels.track}' -n canary)" "canary"
+      - id: five-endpoints
+        desc: The Service has 5 endpoints
+        points: 35
+        hint: "the Service selects app=web only, so both Deployments feed it"
+        run: |
+          RETRY=25 retry bash -c '
+            n=$(kubectl -n canary get endpointslices -l kubernetes.io/service-name=web \
+              -o jsonpath="{.items[*].endpoints[*].addresses[*]}" | wc -w | tr -d " ")
+            [ "$n" -eq 5 ]'
+      - id: split
+        desc: Exactly 4 stable pods and 1 canary pod are Ready
+        points: 35
+        hint: "kubectl -n canary get pods -l track=canary"
+        run: |
+          s=$(ready_pods canary "app=web,track=stable")
+          c=$(ready_pods canary "app=web,track=canary")
+          [ "$s" -eq 4 ] && [ "$c" -eq 1 ]
+    hints:
+      - title: The shared label is the whole trick
+        cost: 8
+        text: |
+          The Service selects only `app=web`. Both Deployments set that
+          label on their pods, so both feed the same Service. The extra
+          `track` label exists purely so *you* can tell them apart and
+          scale them independently.
+      - title: Creating the canary
+        cost: 8
+        text: |
+          ```
+          kubectl -n canary create deployment web-canary \
+            --image=nginx:1.27-alpine --replicas=1 $do > canary.yaml
+          ```
+          Then set the pod labels to `app: web` and `track: canary`, and
+          make `spec.selector.matchLabels` match them.
+      - title: Adjusting the share
+        cost: 8
+        text: |
+          ```
+          kubectl -n canary scale deploy/web-canary --replicas=2   # ~33%
+          kubectl -n canary scale deploy/web-stable --replicas=0   # full promotion
+          ```
+          Promotion is just scaling stable to zero once you trust the canary.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: web-canary, namespace: canary}
+      spec:
+        replicas: 1
+        selector: {matchLabels: {app: web, track: canary}}
+        template:
+          metadata: {labels: {app: web, track: canary}}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+                ports: [{containerPort: 80}]
+      YAML
+
+      kubectl -n canary rollout status deploy/web-canary
+      kubectl -n canary get endpointslices -l kubernetes.io/service-name=web
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: web-canary, namespace: canary}
+      spec:
+        replicas: 1
+        selector: {matchLabels: {app: web, track: canary}}
+        template:
+          metadata: {labels: {app: web, track: canary}}
+          spec:
+            containers:
+              - name: web
+                image: nginx:1.27-alpine
+                ports: [{containerPort: 80}]
+      YAML
+      kubectl -n canary rollout status deploy/web-canary --timeout=300s
+      sleep 8
+
+  - id: app-sidecar-patterns
+    title: Ambassador and adapter sidecars
+    difficulty: hard
+    exams: [CKAD]
+    concepts: [sidecar, ambassador, adapter, multi-container patterns, shared network]
+    par_minutes: 16
+    estimated_minutes: 21
+    blurb: The two named multi-container patterns beyond the plain log-shipping sidecar.
+    scenario: |
+      Containers in a pod share a network namespace, so `localhost` is a
+      real communication channel. Two classic patterns build on that:
+
+      - **Ambassador**: the app talks to `localhost:PORT`; a proxy sidecar
+        handles the messy outside world (TLS, retries, service discovery).
+        The app stays simple and testable.
+      - **Adapter**: a sidecar reads the app's native output and re-publishes
+        it in the format a platform expects - the classic case being metrics
+        translation.
+
+      Build one pod of each.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/pods/#how-pods-manage-multiple-containers
+    tasks:
+      - text: "In `patterns`, create Pod `ambassador` with a `main` container (`curlimages/curl:8.10.1`, sleeping) and a `proxy` container (`nginx:1.27-alpine`) reachable on `127.0.0.1:80` from main."
+      - text: "Prove the ambassador works: from `main`, an HTTP GET of `http://127.0.0.1:80` must succeed."
+      - text: "Create Pod `adapter` with a `main` container writing app output to a shared emptyDir at `/var/log/app.log`, and an `adapter` container reading that file and printing a transformed line to stdout."
+      - text: "The adapter container's logs must contain the transformed output."
+    setup:
+      - kind: shell
+        desc: create the patterns namespace
+        run: kubectl create ns patterns
+    verify:
+      - id: ambassador-shape
+        desc: The ambassador pod has main and proxy containers
+        points: 20
+        hint: "two containers in one pod, no Service needed"
+        run: |
+          names=$(jp pod ambassador '{.spec.containers[*].name}' -n patterns | tr ' ' '\n' | sort | tr '\n' ' ')
+          eq "$names" "main proxy "
+      - id: ambassador-works
+        desc: main can reach the proxy over localhost
+        points: 30
+        hint: "containers in a pod share the network namespace, so 127.0.0.1 is the sidecar"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n patterns get pod ambassador -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          RETRY=15 retry kubectl -n patterns exec ambassador -c main -- \
+            curl -sf --max-time 5 -o /dev/null http://127.0.0.1:80
+      - id: adapter-shape
+        desc: The adapter pod shares an emptyDir between main and adapter
+        points: 25
+        hint: "one emptyDir mounted into both containers"
+        run: |
+          names=$(jp pod adapter '{.spec.containers[*].name}' -n patterns | tr ' ' '\n' | sort | tr '\n' ' ')
+          eq "$names" "adapter main " || exit 1
+          jp pod adapter '{.spec.volumes[0].emptyDir}' -n patterns | grep -q '{'
+      - id: adapter-works
+        desc: The adapter container's logs contain transformed output
+        points: 25
+        hint: "kubectl -n patterns logs adapter -c adapter"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n patterns get pod adapter -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          RETRY=20 retry bash -c 'kubectl -n patterns logs adapter -c adapter --tail=20 2>/dev/null | grep -q "app_lines"'
+    hints:
+      - title: The ambassador pod
+        cost: 10
+        text: |
+          ```yaml
+          containers:
+            - name: main
+              image: curlimages/curl:8.10.1
+              command: ["sleep", "86400"]
+            - name: proxy
+              image: nginx:1.27-alpine
+              ports:
+                - containerPort: 80
+          ```
+          No Service is involved - `main` reaches `proxy` on `127.0.0.1:80`
+          because they share the pod's network namespace.
+      - title: The adapter pod
+        cost: 12
+        text: |
+          ```yaml
+          volumes:
+            - name: shared
+              emptyDir: {}
+          containers:
+            - name: main
+              image: busybox:1.36
+              command: ["sh", "-c"]
+              args: ["while true; do echo request served >> /var/log/app.log; sleep 2; done"]
+              volumeMounts: [{name: shared, mountPath: /var/log}]
+            - name: adapter
+              image: busybox:1.36
+              command: ["sh", "-c"]
+              args: ["while true; do echo app_lines $(wc -l < /var/log/app.log 2>/dev/null || echo 0); sleep 5; done"]
+              volumeMounts: [{name: shared, mountPath: /var/log}]
+          ```
+          The adapter turns the app's raw log into a metric-shaped line -
+          exactly what a real adapter does with Prometheus text format.
+      - title: Exec into a specific container
+        cost: 6
+        text: |
+          ```
+          kubectl -n patterns exec ambassador -c main -- curl -s 127.0.0.1
+          kubectl -n patterns logs adapter -c adapter
+          ```
+          Without `-c` on a multi-container pod, kubectl picks the first
+          container and may not tell you.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: ambassador, namespace: patterns}
+      spec:
+        containers:
+          - name: main
+            image: curlimages/curl:8.10.1
+            command: ["sleep", "86400"]
+          - name: proxy
+            image: nginx:1.27-alpine
+            ports: [{containerPort: 80}]
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: adapter, namespace: patterns}
+      spec:
+        volumes:
+          - name: shared
+            emptyDir: {}
+        containers:
+          - name: main
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do echo request served >> /var/log/app.log; sleep 2; done"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+          - name: adapter
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do echo app_lines $(wc -l < /var/log/app.log 2>/dev/null || echo 0); sleep 5; done"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+      YAML
+
+      kubectl -n patterns exec ambassador -c main -- curl -s 127.0.0.1 | head -3
+      kubectl -n patterns logs adapter -c adapter
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: ambassador, namespace: patterns}
+      spec:
+        containers:
+          - name: main
+            image: curlimages/curl:8.10.1
+            command: ["sleep", "86400"]
+          - name: proxy
+            image: nginx:1.27-alpine
+            ports: [{containerPort: 80}]
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: adapter, namespace: patterns}
+      spec:
+        volumes:
+          - name: shared
+            emptyDir: {}
+        containers:
+          - name: main
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do echo request served >> /var/log/app.log; sleep 2; done"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+          - name: adapter
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do echo app_lines $(wc -l < /var/log/app.log 2>/dev/null || echo 0); sleep 5; done"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+      YAML
+      kubectl -n patterns wait --for=condition=Ready pod/ambassador pod/adapter --timeout=300s
+      sleep 12
+
+  - id: app-native-sidecar
+    title: Native sidecar containers with restartPolicy Always
+    difficulty: hard
+    exams: [CKAD, CKA]
+    concepts: [sidecar containers, init containers, restartPolicy, startup ordering]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: The modern sidecar - an init container that never exits, and finally works with Jobs.
+    scenario: |
+      Classic sidecars have two long-standing problems: they start at the
+      same time as the app (so a proxy may not be ready when the app first
+      calls out), and in a Job they never exit, so the Job never completes.
+
+      Kubernetes 1.29 made this properly supported: an entry in
+      `initContainers` with `restartPolicy: Always` is a **native sidecar**.
+      It starts before the app containers, keeps running alongside them, and
+      is ignored when deciding whether a Job has finished.
+
+      Build one, and prove the Job case works.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/
+    tasks:
+      - text: "In `native`, create Pod `app` with a native sidecar `logger` (`busybox:1.36`, tailing a shared file) declared under `initContainers` with `restartPolicy: Always`."
+      - text: "The main container `main` writes to that shared file."
+      - text: "Create a Job `batch-with-sidecar` in `native` with the same native sidecar plus a main container that does work and exits 0."
+      - text: "That Job must reach Complete - which is only possible because the sidecar is a native one."
+    setup:
+      - kind: shell
+        desc: create the native namespace
+        run: kubectl create ns native
+    verify:
+      - id: sidecar-declared
+        desc: Pod native/app declares logger as an init container with restartPolicy Always
+        points: 30
+        hint: "initContainers entry with restartPolicy: Always -- that is what makes it a sidecar"
+        run: |
+          eq "$(jp pod app '{.spec.initContainers[?(@.name=="logger")].restartPolicy}' -n native)" "Always"
+      - id: pod-running
+        desc: The pod is Running with both the sidecar and the main container alive
+        points: 25
+        hint: "kubectl -n native get pod app -- a native sidecar shows as an init container that stays Running"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n native get pod app -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          jp pod app '{.status.initContainerStatuses[?(@.name=="logger")].state.running}' -n native | grep -q .
+      - id: job-sidecar
+        desc: The Job also uses a native sidecar
+        points: 20
+        hint: "same initContainers + restartPolicy: Always inside the Job's pod template"
+        run: |
+          eq "$(jp job batch-with-sidecar '{.spec.template.spec.initContainers[0].restartPolicy}' -n native)" "Always"
+      - id: job-completes
+        desc: The Job reaches Complete despite having a never-ending sidecar
+        points: 25
+        hint: "a classic sidecar would keep the Job running forever -- a native one does not"
+        run: |
+          RETRY=45 retry bash -c '[ "$(kubectl -n native get job batch-with-sidecar -o jsonpath="{.status.succeeded}")" = "1" ]'
+    hints:
+      - title: What makes it native
+        cost: 10
+        text: |
+          ```yaml
+          spec:
+            initContainers:
+              - name: logger
+                image: busybox:1.36
+                restartPolicy: Always          # <- this one field
+                command: ["sh", "-c"]
+                args: ["tail -F /var/log/app.log"]
+                volumeMounts: [{name: shared, mountPath: /var/log}]
+            containers:
+              - name: main
+                ...
+          ```
+          Without `restartPolicy: Always` it is an ordinary init container
+          and the pod would hang waiting for `tail` to exit.
+      - title: Why the Job completes
+        cost: 12
+        text: |
+          A Job is Complete when its **regular** containers succeed. Native
+          sidecars live in `initContainers`, so the Job controller ignores
+          them and terminates them once the main container is done. That was
+          impossible before 1.29 and is the main reason the feature exists.
+      - title: The Job manifest
+        cost: 10
+        text: |
+          ```yaml
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: batch-with-sidecar, namespace: native}
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                volumes: [{name: shared, emptyDir: {}}]
+                initContainers:
+                  - name: logger
+                    image: busybox:1.36
+                    restartPolicy: Always
+                    command: ["sh", "-c"]
+                    args: ["tail -F /var/log/app.log 2>/dev/null || sleep 3600"]
+                    volumeMounts: [{name: shared, mountPath: /var/log}]
+                containers:
+                  - name: worker
+                    image: busybox:1.36
+                    command: ["sh", "-c"]
+                    args: ["echo working >> /var/log/app.log; sleep 5; echo done"]
+                    volumeMounts: [{name: shared, mountPath: /var/log}]
+          ```
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: app, namespace: native}
+      spec:
+        volumes: [{name: shared, emptyDir: {}}]
+        initContainers:
+          - name: logger
+            image: busybox:1.36
+            restartPolicy: Always
+            command: ["sh", "-c"]
+            args: ["touch /var/log/app.log; tail -F /var/log/app.log"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+        containers:
+          - name: main
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do echo hello >> /var/log/app.log; sleep 5; done"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata: {name: batch-with-sidecar, namespace: native}
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            volumes: [{name: shared, emptyDir: {}}]
+            initContainers:
+              - name: logger
+                image: busybox:1.36
+                restartPolicy: Always
+                command: ["sh", "-c"]
+                args: ["touch /var/log/app.log; tail -F /var/log/app.log"]
+                volumeMounts: [{name: shared, mountPath: /var/log}]
+            containers:
+              - name: worker
+                image: busybox:1.36
+                command: ["sh", "-c"]
+                args: ["echo working >> /var/log/app.log; sleep 5; echo done"]
+                volumeMounts: [{name: shared, mountPath: /var/log}]
+      YAML
+
+      kubectl -n native wait --for=condition=complete job/batch-with-sidecar --timeout=120s
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: app, namespace: native}
+      spec:
+        volumes: [{name: shared, emptyDir: {}}]
+        initContainers:
+          - name: logger
+            image: busybox:1.36
+            restartPolicy: Always
+            command: ["sh", "-c"]
+            args: ["touch /var/log/app.log; tail -F /var/log/app.log"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+        containers:
+          - name: main
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do echo hello >> /var/log/app.log; sleep 5; done"]
+            volumeMounts: [{name: shared, mountPath: /var/log}]
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata: {name: batch-with-sidecar, namespace: native}
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            volumes: [{name: shared, emptyDir: {}}]
+            initContainers:
+              - name: logger
+                image: busybox:1.36
+                restartPolicy: Always
+                command: ["sh", "-c"]
+                args: ["touch /var/log/app.log; tail -F /var/log/app.log"]
+                volumeMounts: [{name: shared, mountPath: /var/log}]
+            containers:
+              - name: worker
+                image: busybox:1.36
+                command: ["sh", "-c"]
+                args: ["echo working >> /var/log/app.log; sleep 5; echo done"]
+                volumeMounts: [{name: shared, mountPath: /var/log}]
+      YAML
+      kubectl -n native wait --for=condition=Ready pod/app --timeout=300s
+      kubectl -n native wait --for=condition=complete job/batch-with-sidecar --timeout=300s

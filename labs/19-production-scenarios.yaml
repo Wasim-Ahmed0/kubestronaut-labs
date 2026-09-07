@@ -1,0 +1,916 @@
+category: Production Scenarios
+labs:
+
+  - id: prod-black-friday
+    title: Incident - the checkout service is falling over under load
+    difficulty: expert
+    exams: [CKA, CKAD]
+    concepts: [incident response, resources, hpa, pdb, probes, capacity]
+    par_minutes: 25
+    estimated_minutes: 32
+    cluster:
+      nodes: 2
+      install:
+        - name: metrics-server
+          timeout: 420
+          run: |
+            kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+            kubectl -n kube-system patch deployment metrics-server --type=json \
+              -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+            kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s
+    blurb: A multi-fault production incident. No single fix will do it.
+    scenario: |
+      **07:14.** Checkout is timing out intermittently. Traffic is four
+      times normal. You are on call.
+
+      What you have been told:
+
+      - `checkout` is a 2-replica Deployment in `storefront`
+      - it can serve about 40 requests per second per pod
+      - it must never drop below 2 available pods during maintenance
+      - it must scale automatically between 2 and 8 pods at 70% CPU
+
+      What you will find when you look:
+
+      - the pods have no resource requests, so the scheduler has been
+        packing them badly and an HPA could not work even if one existed
+      - there is no HPA
+      - there is no PodDisruptionBudget
+      - the readiness probe is far too slow to take a sick pod out of
+        rotation, and the liveness probe is aggressive enough to restart
+        pods that are merely busy
+
+      Stabilise it. This is a long one - work through it methodically and
+      run `verify` as you go to see what is still outstanding.
+    docs:
+      - https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+      - https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+      - https://kubernetes.io/docs/tasks/run-application/configure-pdb/
+    tasks:
+      - text: "Give the `checkout` container requests of 100m CPU / 128Mi memory and limits of 500m CPU / 256Mi."
+      - text: "Fix the readiness probe: HTTP GET `/` on port 80, `periodSeconds: 5`, `failureThreshold: 2` - it must eject a bad pod within about 10 seconds."
+      - text: "Fix the liveness probe: `periodSeconds: 10`, `failureThreshold: 5`, `timeoutSeconds: 3` - it must not restart a merely slow pod."
+      - text: "Create an HPA `checkout` targeting the Deployment: min 2, max 8, 70% average CPU."
+      - text: "Create a PodDisruptionBudget `checkout` with `minAvailable: 2`."
+      - text: "Leave the Deployment healthy, and the HPA reading real metrics."
+    setup:
+      - kind: shell
+        desc: deploy checkout with production-realistic misconfiguration
+        timeout: 420
+        run: |
+          kubectl create ns storefront
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: checkout, namespace: storefront}
+          spec:
+            replicas: 2
+            selector: {matchLabels: {app: checkout}}
+            template:
+              metadata: {labels: {app: checkout}}
+              spec:
+                containers:
+                  - name: web
+                    image: nginx:1.27-alpine
+                    ports: [{containerPort: 80}]
+                    readinessProbe:
+                      httpGet: {path: /, port: 80}
+                      periodSeconds: 60
+                      failureThreshold: 10
+                    livenessProbe:
+                      httpGet: {path: /, port: 80}
+                      periodSeconds: 2
+                      failureThreshold: 1
+                      timeoutSeconds: 1
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: checkout, namespace: storefront}
+          spec:
+            selector: {app: checkout}
+            ports: [{port: 80, targetPort: 80}]
+          YAML
+          kubectl -n storefront rollout status deploy/checkout --timeout=300s
+    verify:
+      - id: resources
+        desc: Requests and limits are set correctly
+        points: 20
+        hint: "kubectl -n storefront set resources deploy/checkout --requests=cpu=100m,memory=128Mi --limits=cpu=500m,memory=256Mi"
+        run: |
+          r='.spec.template.spec.containers[0].resources'
+          eq "$(jp deploy checkout "{$r.requests.cpu}" -n storefront)" "100m" || exit 1
+          eq "$(jp deploy checkout "{$r.requests.memory}" -n storefront)" "128Mi" || exit 1
+          eq "$(jp deploy checkout "{$r.limits.cpu}" -n storefront)" "500m" || exit 1
+          eq "$(jp deploy checkout "{$r.limits.memory}" -n storefront)" "256Mi"
+      - id: readiness
+        desc: The readiness probe ejects a bad pod quickly
+        points: 20
+        hint: "periodSeconds 5 and failureThreshold 2 means roughly 10 seconds to eject"
+        run: |
+          p='.spec.template.spec.containers[0].readinessProbe'
+          eq "$(jp deploy checkout "{$p.periodSeconds}" -n storefront)" "5" || exit 1
+          eq "$(jp deploy checkout "{$p.failureThreshold}" -n storefront)" "2" || exit 1
+          eq "$(jp deploy checkout "{$p.httpGet.port}" -n storefront)" "80"
+      - id: liveness
+        desc: The liveness probe is no longer trigger-happy
+        points: 20
+        hint: "periodSeconds 10, failureThreshold 5, timeoutSeconds 3"
+        run: |
+          p='.spec.template.spec.containers[0].livenessProbe'
+          eq "$(jp deploy checkout "{$p.periodSeconds}" -n storefront)" "10" || exit 1
+          eq "$(jp deploy checkout "{$p.failureThreshold}" -n storefront)" "5" || exit 1
+          eq "$(jp deploy checkout "{$p.timeoutSeconds}" -n storefront)" "3"
+      - id: hpa
+        desc: An HPA scales the Deployment between 2 and 8 at 70% CPU
+        points: 20
+        hint: "kubectl -n storefront autoscale deploy checkout --min=2 --max=8 --cpu-percent=70"
+        run: |
+          eq "$(jp hpa checkout '{.spec.minReplicas}' -n storefront)" "2" || exit 1
+          eq "$(jp hpa checkout '{.spec.maxReplicas}' -n storefront)" "8" || exit 1
+          eq "$(jp hpa checkout '{.spec.scaleTargetRef.name}' -n storefront)" "checkout" || exit 1
+          jp hpa checkout '{.spec.metrics[0].resource.target.averageUtilization}' -n storefront | grep -qx 70
+      - id: pdb
+        desc: A PodDisruptionBudget protects 2 available pods
+        points: 10
+        hint: "kubectl -n storefront create pdb checkout --selector=app=checkout --min-available=2"
+        run: |
+          eq "$(jp pdb checkout '{.spec.minAvailable}' -n storefront)" "2" || exit 1
+          eq "$(jp pdb checkout '{.spec.selector.matchLabels.app}' -n storefront)" "checkout"
+      - id: healthy
+        desc: The service is stable and the HPA is reading real metrics
+        points: 10
+        hint: "kubectl -n storefront get hpa -- TARGETS should be a percentage, not <unknown>"
+        run: |
+          rollout storefront deploy/checkout 300s || exit 1
+          RETRY=45 retry bash -c '
+            kubectl -n storefront get hpa checkout \
+              -o jsonpath="{.status.currentMetrics[0].resource.current.averageUtilization}" \
+              | grep -Eq "^[0-9]+$"'
+      - id: no-restart-storm
+        desc: Pods are not restart-looping any more
+        points: 0
+        hint: "an over-aggressive liveness probe shows up as climbing restart counts"
+        run: |
+          RETRY=15 retry bash -c '
+            latest=$(kubectl -n storefront get pods -l app=checkout \
+              -o jsonpath="{range .items[*]}{.status.containerStatuses[0].restartCount}{\"\n\"}{end}" \
+              | sort -rn | head -1)
+            [ "${latest:-0}" -le 3 ]'
+    hints:
+      - title: Triage order for a live incident
+        cost: 10
+        text: |
+          ```
+          kubectl -n storefront get pods                   # restarts? ready?
+          kubectl -n storefront describe deploy checkout    # what is configured
+          kubectl -n storefront get events --sort-by=.metadata.creationTimestamp | tail -20
+          kubectl top pods -n storefront
+          ```
+          Restart counts climbing with no crash in the logs is the signature
+          of a liveness probe killing healthy pods.
+      - title: Why the requests come first
+        cost: 12
+        text: |
+          Without a CPU request there is no denominator for "70% CPU", so
+          the HPA reports `<unknown>` and never scales. It also means the
+          scheduler treats the pod as costing nothing and packs nodes until
+          they thrash. Fix the requests before you create the HPA.
+      - title: Probe tuning rules of thumb
+        cost: 12
+        text: |
+          - readiness: check often, fail fast. Ejecting a struggling pod is
+            cheap and reversible.
+          - liveness: check rarely, fail slowly, and give it a generous
+            timeout. Restarting is expensive and, under load, a
+            trigger-happy liveness probe turns a slowdown into an outage.
+          - if a pod is slow to start, that is what `startupProbe` is for -
+            do not loosen liveness to compensate.
+      - title: The commands
+        cost: 12
+        text: |
+          ```
+          kubectl -n storefront set resources deploy/checkout \
+            --requests=cpu=100m,memory=128Mi --limits=cpu=500m,memory=256Mi
+
+          kubectl -n storefront patch deploy checkout --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"web",
+            "readinessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":5,"failureThreshold":2},
+            "livenessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":10,"failureThreshold":5,"timeoutSeconds":3}}]}}}}'
+
+          kubectl -n storefront autoscale deploy checkout --min=2 --max=8 --cpu-percent=70
+          kubectl -n storefront create pdb checkout --selector=app=checkout --min-available=2
+          ```
+    solution: |
+      ```bash
+      # 1. resources first - everything else depends on them
+      kubectl -n storefront set resources deploy/checkout \
+        --requests=cpu=100m,memory=128Mi --limits=cpu=500m,memory=256Mi
+
+      # 2. probes
+      kubectl -n storefront patch deploy checkout --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"web",
+        "readinessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":5,"failureThreshold":2},
+        "livenessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":10,"failureThreshold":5,"timeoutSeconds":3}}]}}}}'
+
+      kubectl -n storefront rollout status deploy/checkout
+
+      # 3. autoscaling
+      kubectl -n storefront autoscale deploy checkout --min=2 --max=8 --cpu-percent=70
+
+      # 4. protect availability during maintenance
+      kubectl -n storefront create pdb checkout --selector=app=checkout --min-available=2
+
+      kubectl -n storefront get hpa,pdb,deploy
+      ```
+    solve_script: |
+      kubectl -n storefront set resources deploy/checkout \
+        --requests=cpu=100m,memory=128Mi --limits=cpu=500m,memory=256Mi
+      kubectl -n storefront patch deploy checkout --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"web","readinessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":5,"failureThreshold":2},"livenessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":10,"failureThreshold":5,"timeoutSeconds":3}}]}}}}'
+      kubectl -n storefront rollout status deploy/checkout --timeout=300s
+      kubectl -n storefront autoscale deploy checkout --min=2 --max=8 --cpu-percent=70
+      kubectl -n storefront create pdb checkout --selector=app=checkout --min-available=2
+      sleep 60
+
+  - id: prod-noisy-neighbour
+    title: Incident - one team is starving everyone else
+    difficulty: hard
+    exams: [CKA]
+    concepts: [resource quotas, limitrange, eviction, qos, multi-tenancy, capacity]
+    par_minutes: 20
+    estimated_minutes: 26
+    cluster:
+      nodes: 2
+    blurb: A shared cluster where one namespace has no limits. Contain it without an outage.
+    scenario: |
+      **Ticket:** "Our pods keep getting evicted and we did not change
+      anything."
+
+      What actually happened: the `analytics` namespace has no quota, no
+      LimitRange, and its pods declare no resources at all. They are
+      BestEffort, so they are first to be evicted under pressure - but they
+      also consume everything, so *other* namespaces suffer too.
+
+      Contain the blast radius without taking `analytics` down:
+
+      1. give the namespace a hard budget
+      2. give it defaults so unsized pods stop appearing
+      3. size the existing workload so it fits and stops being BestEffort
+      4. leave the well-behaved `payments` namespace untouched
+    docs:
+      - https://kubernetes.io/docs/concepts/policy/resource-quotas/
+      - https://kubernetes.io/docs/concepts/policy/limit-range/
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/
+    tasks:
+      - text: "Create a ResourceQuota `analytics-quota` in `analytics`: requests.cpu 2, requests.memory 2Gi, limits.cpu 4, limits.memory 4Gi, pods 10."
+      - text: "Create a LimitRange `analytics-defaults` in `analytics` for Containers: default cpu 200m / memory 256Mi, defaultRequest cpu 100m / memory 128Mi."
+      - text: "Resize the existing `analytics/cruncher` Deployment so its containers have explicit requests and limits and are no longer BestEffort."
+      - text: "`analytics/cruncher` must still be running with 3 replicas."
+      - text: "Do not add a quota or LimitRange to the `payments` namespace."
+    setup:
+      - kind: shell
+        desc: create an unconstrained analytics workload and a well-behaved neighbour
+        timeout: 420
+        run: |
+          kubectl create ns analytics
+          kubectl create ns payments
+          kubectl -n analytics create deployment cruncher --image=registry.k8s.io/pause:3.9 --replicas=3
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: api, namespace: payments}
+          spec:
+            replicas: 2
+            selector: {matchLabels: {app: api}}
+            template:
+              metadata: {labels: {app: api}}
+              spec:
+                containers:
+                  - name: c
+                    image: registry.k8s.io/pause:3.9
+                    resources:
+                      requests: {cpu: 100m, memory: 128Mi}
+                      limits: {cpu: 200m, memory: 256Mi}
+          YAML
+          kubectl -n analytics rollout status deploy/cruncher --timeout=300s
+          kubectl -n payments rollout status deploy/api --timeout=300s
+    verify:
+      - id: quota
+        desc: The analytics namespace has the required hard budget
+        points: 25
+        hint: "kubectl -n analytics create quota analytics-quota --hard=requests.cpu=2,..."
+        run: |
+          eq "$(jp quota analytics-quota '{.spec.hard.requests\.cpu}' -n analytics)" "2" || exit 1
+          eq "$(jp quota analytics-quota '{.spec.hard.requests\.memory}' -n analytics)" "2Gi" || exit 1
+          eq "$(jp quota analytics-quota '{.spec.hard.limits\.cpu}' -n analytics)" "4" || exit 1
+          eq "$(jp quota analytics-quota '{.spec.hard.limits\.memory}' -n analytics)" "4Gi" || exit 1
+          eq "$(jp quota analytics-quota '{.spec.hard.pods}' -n analytics)" "10"
+      - id: limitrange
+        desc: A LimitRange supplies defaults so unsized pods stop appearing
+        points: 25
+        hint: "type: Container with default and defaultRequest"
+        run: |
+          l='.spec.limits[0]'
+          eq "$(jp limitrange analytics-defaults "{$l.type}" -n analytics)" "Container" || exit 1
+          eq "$(jp limitrange analytics-defaults "{$l.default.cpu}" -n analytics)" "200m" || exit 1
+          eq "$(jp limitrange analytics-defaults "{$l.default.memory}" -n analytics)" "256Mi" || exit 1
+          eq "$(jp limitrange analytics-defaults "{$l.defaultRequest.cpu}" -n analytics)" "100m" || exit 1
+          eq "$(jp limitrange analytics-defaults "{$l.defaultRequest.memory}" -n analytics)" "128Mi"
+      - id: sized
+        desc: The cruncher workload now declares requests and limits
+        points: 25
+        hint: "kubectl -n analytics set resources deploy/cruncher --requests=... --limits=..."
+        run: |
+          r='.spec.template.spec.containers[0].resources'
+          jp deploy cruncher "{$r.requests.cpu}" -n analytics | grep -q . || exit 1
+          jp deploy cruncher "{$r.limits.memory}" -n analytics | grep -q .
+      - id: not-besteffort
+        desc: Its running pods are no longer BestEffort
+        points: 15
+        hint: "BestEffort pods are the first thing the kubelet evicts under pressure"
+        run: |
+          rollout analytics deploy/cruncher 300s || exit 1
+          n=$(kubectl -n analytics get pods -l app=cruncher \
+                -o jsonpath='{range .items[*]}{.status.qosClass}{"\n"}{end}' \
+                | grep -c 'BestEffort' || true)
+          [ "${n:-0}" -eq 0 ]
+      - id: still-running
+        desc: cruncher is still running its 3 replicas
+        points: 10
+        hint: "containment must not become an outage"
+        run: |
+          eq "$(jp deploy cruncher '{.status.readyReplicas}' -n analytics)" "3"
+      - id: neighbour-untouched
+        desc: The payments namespace was left alone
+        points: 0
+        hint: "only analytics was the problem"
+        run: |
+          n=$(kubectl -n payments get quota,limitrange --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          [ "${n:-0}" -eq 0 ] || exit 1
+          eq "$(jp deploy api '{.status.readyReplicas}' -n payments)" "2"
+    hints:
+      - title: See the damage first
+        cost: 10
+        text: |
+          ```
+          kubectl -n analytics get pods \
+            -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+          kubectl top pods -n analytics 2>/dev/null
+          kubectl describe node | grep -A8 "Allocated resources"
+          ```
+          Everything BestEffort in a namespace with no quota is the whole
+          diagnosis.
+      - title: The order that avoids an outage
+        cost: 12
+        text: |
+          Do it in this order:
+
+          1. LimitRange first, so new pods get defaults
+          2. then the quota
+          3. then resize the existing Deployment
+
+          If you add the quota first, the next rollout of an unsized
+          Deployment is rejected outright - a self-inflicted outage. The
+          LimitRange is what prevents that.
+      - title: The commands
+        cost: 12
+        text: |
+          ```
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: LimitRange
+          metadata: {name: analytics-defaults, namespace: analytics}
+          spec:
+            limits:
+              - type: Container
+                default: {cpu: 200m, memory: 256Mi}
+                defaultRequest: {cpu: 100m, memory: 128Mi}
+          YAML
+
+          kubectl -n analytics create quota analytics-quota \
+            --hard=requests.cpu=2,requests.memory=2Gi,limits.cpu=4,limits.memory=4Gi,pods=10
+
+          kubectl -n analytics set resources deploy/cruncher \
+            --requests=cpu=100m,memory=128Mi --limits=cpu=200m,memory=256Mi
+          ```
+    solution: |
+      ```bash
+      # 1. defaults first, so nothing new can arrive unsized
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: LimitRange
+      metadata: {name: analytics-defaults, namespace: analytics}
+      spec:
+        limits:
+          - type: Container
+            default: {cpu: 200m, memory: 256Mi}
+            defaultRequest: {cpu: 100m, memory: 128Mi}
+      YAML
+
+      # 2. the hard budget
+      kubectl -n analytics create quota analytics-quota \
+        --hard=requests.cpu=2,requests.memory=2Gi,limits.cpu=4,limits.memory=4Gi,pods=10
+
+      # 3. size the existing workload
+      kubectl -n analytics set resources deploy/cruncher \
+        --requests=cpu=100m,memory=128Mi --limits=cpu=200m,memory=256Mi
+      kubectl -n analytics rollout status deploy/cruncher
+
+      kubectl -n analytics get pods \
+        -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+      kubectl -n analytics describe quota analytics-quota
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: LimitRange
+      metadata: {name: analytics-defaults, namespace: analytics}
+      spec:
+        limits:
+          - type: Container
+            default: {cpu: 200m, memory: 256Mi}
+            defaultRequest: {cpu: 100m, memory: 128Mi}
+      YAML
+      kubectl -n analytics create quota analytics-quota \
+        --hard=requests.cpu=2,requests.memory=2Gi,limits.cpu=4,limits.memory=4Gi,pods=10
+      kubectl -n analytics set resources deploy/cruncher \
+        --requests=cpu=100m,memory=128Mi --limits=cpu=200m,memory=256Mi
+      kubectl -n analytics rollout status deploy/cruncher --timeout=300s
+
+  - id: prod-cascading-failure
+    title: Incident - a config change took down three services
+    difficulty: expert
+    exams: [CKA, CKAD]
+    concepts: [incident response, configmaps, rollouts, dependencies, rollback]
+    par_minutes: 24
+    estimated_minutes: 30
+    blurb: One bad ConfigMap, three broken services, and a dependency chain to untangle.
+    scenario: |
+      **02:41.** Someone updated a shared ConfigMap an hour ago. Since then
+      `frontend` cannot start, `api` is crash-looping, and `worker` is
+      running but doing nothing.
+
+      The `shared-config` ConfigMap in `platform` is used by all three, and
+      the change broke it in a way each service reacts to differently:
+
+      - `frontend` mounts a key that no longer exists, so its pods never
+        start
+      - `api` reads `DATABASE_PORT` as an env var and the new value is not a
+        number, so it exits on boot
+      - `worker` reads the config from a mounted file and is still holding
+        the *old* content in memory, because mounted ConfigMaps update but
+        the process never re-read them
+
+      Restore service. The correct values are:
+      `DATABASE_HOST=db.platform.svc.cluster.local`, `DATABASE_PORT=5432`,
+      `LOG_LEVEL=info`, and a key `app.conf` containing `mode=production`.
+    docs:
+      - https://kubernetes.io/docs/concepts/configuration/configmap/
+      - https://kubernetes.io/docs/tasks/debug/debug-application/
+    tasks:
+      - text: "Repair the `platform/shared-config` ConfigMap so it has all four correct keys."
+      - text: "Get `platform/frontend` running (2 replicas ready)."
+      - text: "Get `platform/api` running (2 replicas ready) with a numeric DATABASE_PORT in its environment."
+      - text: "Force `platform/worker` to pick up the corrected configuration."
+      - text: "Record in ConfigMap `incident` in `platform`: key `root_cause` = `configmap`, key `worker_fix` = `restart` (mounted config needs a restart if the app does not re-read it)."
+    setup:
+      - kind: shell
+        desc: deploy three services and then break their shared config
+        timeout: 420
+        run: |
+          kubectl create ns platform
+          kubectl -n platform create configmap shared-config \
+            --from-literal=DATABASE_HOST=db.platform.svc.cluster.local \
+            --from-literal=DATABASE_PORT=not-a-number \
+            --from-literal=LOG_LEVEL=info
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: frontend, namespace: platform}
+          spec:
+            replicas: 2
+            selector: {matchLabels: {app: frontend}}
+            template:
+              metadata: {labels: {app: frontend}}
+              spec:
+                volumes:
+                  - name: conf
+                    configMap:
+                      name: shared-config
+                      items:
+                        - key: app.conf
+                          path: app.conf
+                containers:
+                  - name: web
+                    image: nginx:1.27-alpine
+                    volumeMounts: [{name: conf, mountPath: /etc/appconf}]
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: api, namespace: platform}
+          spec:
+            replicas: 2
+            selector: {matchLabels: {app: api}}
+            template:
+              metadata: {labels: {app: api}}
+              spec:
+                containers:
+                  - name: api
+                    image: busybox:1.36
+                    command: ["sh", "-c"]
+                    args:
+                      - 'case "$DATABASE_PORT" in *[!0-9]*|"") echo "FATAL: DATABASE_PORT is not numeric: $DATABASE_PORT"; exit 1;; esac; echo ok; sleep 86400'
+                    envFrom:
+                      - configMapRef: {name: shared-config}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: worker, namespace: platform}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: worker}}
+            template:
+              metadata: {labels: {app: worker}}
+              spec:
+                volumes:
+                  - name: conf
+                    configMap: {name: shared-config}
+                containers:
+                  - name: worker
+                    image: busybox:1.36
+                    command: ["sh", "-c"]
+                    args: ["while true; do sleep 30; done"]
+                    volumeMounts: [{name: conf, mountPath: /etc/appconf}]
+          YAML
+          sleep 25
+    verify:
+      - id: configmap
+        desc: The shared ConfigMap has all four correct keys
+        points: 25
+        hint: "recreate it: kubectl -n platform create cm shared-config --from-literal=... --dry-run=client -o yaml | kubectl apply -f -"
+        run: |
+          eq "$(jp cm shared-config '{.data.DATABASE_HOST}' -n platform)" "db.platform.svc.cluster.local" || exit 1
+          eq "$(jp cm shared-config '{.data.DATABASE_PORT}' -n platform)" "5432" || exit 1
+          eq "$(jp cm shared-config '{.data.LOG_LEVEL}' -n platform)" "info" || exit 1
+          jp cm shared-config '{.data.app\.conf}' -n platform | grep -q 'mode=production'
+      - id: frontend
+        desc: frontend has 2 ready replicas
+        points: 20
+        hint: "its pods could not start because the app.conf key did not exist"
+        run: |
+          rollout platform deploy/frontend 300s || exit 1
+          eq "$(jp deploy frontend '{.status.readyReplicas}' -n platform)" "2"
+      - id: api
+        desc: api has 2 ready replicas and a numeric port in its environment
+        points: 25
+        hint: "env vars are fixed at container start -- the pods must be restarted after fixing the ConfigMap"
+        run: |
+          rollout platform deploy/api 300s || exit 1
+          eq "$(jp deploy api '{.status.readyReplicas}' -n platform)" "2" || exit 1
+          pod=$(kubectl -n platform get pods -l app=api -o name | head -1)
+          val=$(kubectl -n platform exec "$pod" -- sh -c 'echo $DATABASE_PORT' 2>/dev/null | tr -d '\r')
+          eq "$val" "5432"
+      - id: worker
+        desc: worker sees the corrected configuration on disk
+        points: 20
+        hint: "a mounted ConfigMap updates within a minute, but restarting is the reliable fix"
+        run: |
+          rollout platform deploy/worker 300s || exit 1
+          pod=$(kubectl -n platform get pods -l app=worker -o name | head -1)
+          [ -n "$pod" ] || exit 1
+          RETRY=30 retry bash -c "kubectl -n platform exec $pod -- cat /etc/appconf/DATABASE_PORT 2>/dev/null | grep -qx 5432"
+      - id: postmortem
+        desc: You recorded the root cause and the fix
+        points: 10
+        hint: "kubectl -n platform create configmap incident --from-literal=root_cause=configmap --from-literal=worker_fix=restart"
+        run: |
+          eq "$(jp cm incident '{.data.root_cause}' -n platform | tr -d ' ')" "configmap" || exit 1
+          eq "$(jp cm incident '{.data.worker_fix}' -n platform | tr -d ' ')" "restart"
+    hints:
+      - title: Find the shared dependency
+        cost: 10
+        text: |
+          ```
+          kubectl -n platform get pods
+          kubectl -n platform describe pod -l app=frontend | tail -15
+          kubectl -n platform logs -l app=api --tail=5
+          kubectl -n platform get cm shared-config -o yaml
+          ```
+          Three services broken at once, all referencing one ConfigMap, is
+          rarely a coincidence.
+      - title: Repairing the ConfigMap
+        cost: 12
+        text: |
+          You cannot `kubectl edit` in a new key cleanly from the CLI, so
+          regenerate the whole thing:
+
+          ```
+          kubectl -n platform create configmap shared-config \
+            --from-literal=DATABASE_HOST=db.platform.svc.cluster.local \
+            --from-literal=DATABASE_PORT=5432 \
+            --from-literal=LOG_LEVEL=info \
+            --from-literal=app.conf='mode=production' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          ```
+      - title: Why each service needs different treatment
+        cost: 12
+        text: |
+          - **frontend** mounts a specific key. A missing key means the
+            volume cannot be built and the pod never starts. Fixing the
+            ConfigMap is enough - the kubelet retries by itself.
+          - **api** reads env vars, which are frozen at container start.
+            Fixing the ConfigMap changes nothing until you restart:
+            `kubectl -n platform rollout restart deploy/api`
+          - **worker** mounts the whole ConfigMap, so the *files* update on
+            their own within a minute or two - but any process that read
+            them at boot still holds the old values. Restart it too.
+      - title: The restart command
+        cost: 8
+        text: |
+          ```
+          kubectl -n platform rollout restart deploy/api deploy/worker deploy/frontend
+          kubectl -n platform rollout status deploy/api
+          ```
+          `rollout restart` triggers a normal rolling update by stamping an
+          annotation on the pod template - no config change required.
+    solution: |
+      ```bash
+      kubectl -n platform get cm shared-config -o yaml     # DATABASE_PORT=not-a-number, no app.conf
+
+      kubectl -n platform create configmap shared-config \
+        --from-literal=DATABASE_HOST=db.platform.svc.cluster.local \
+        --from-literal=DATABASE_PORT=5432 \
+        --from-literal=LOG_LEVEL=info \
+        --from-literal=app.conf='mode=production' \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      kubectl -n platform rollout restart deploy/api deploy/worker deploy/frontend
+      kubectl -n platform rollout status deploy/api
+      kubectl -n platform rollout status deploy/frontend
+      kubectl -n platform rollout status deploy/worker
+
+      kubectl -n platform create configmap incident \
+        --from-literal=root_cause=configmap --from-literal=worker_fix=restart
+      ```
+    solve_script: |
+      kubectl -n platform create configmap shared-config \
+        --from-literal=DATABASE_HOST=db.platform.svc.cluster.local \
+        --from-literal=DATABASE_PORT=5432 \
+        --from-literal=LOG_LEVEL=info \
+        --from-literal=app.conf='mode=production' \
+        --dry-run=client -o yaml | kubectl apply -f -
+      kubectl -n platform rollout restart deploy/api deploy/worker deploy/frontend
+      kubectl -n platform rollout status deploy/api --timeout=300s
+      kubectl -n platform rollout status deploy/frontend --timeout=300s
+      kubectl -n platform rollout status deploy/worker --timeout=300s
+      kubectl -n platform create configmap incident \
+        --from-literal=root_cause=configmap --from-literal=worker_fix=restart
+
+  - id: prod-security-incident
+    title: Incident - a workload has been compromised
+    difficulty: expert
+    exams: [CKS, KCSA]
+    concepts: [incident response, containment, rbac, network policy, forensics, privilege escalation]
+    par_minutes: 25
+    estimated_minutes: 32
+    cluster:
+      nodes: 1
+      cni: calico
+    blurb: Contain, investigate, evict. The CKS incident-response drill end to end.
+    scenario: |
+      **Alert:** unusual outbound traffic from a pod in `webapp`.
+
+      A pod called `compromised` is running with far more privilege than it
+      should, and its ServiceAccount can read Secrets across the cluster.
+      Assume the attacker has shell access inside it.
+
+      Work the standard order. Containment comes before investigation, and
+      investigation before eviction - if you delete the pod first you lose
+      the evidence and you still do not know what they reached.
+
+      1. **Contain** - cut its network with a deny-all NetworkPolicy
+      2. **Contain** - remove the over-broad RBAC its identity holds
+      3. **Investigate** - record what it could reach
+      4. **Evict** - remove the workload and replace it with a hardened one
+
+      This cluster runs Calico, so your NetworkPolicy genuinely takes effect.
+    docs:
+      - https://kubernetes.io/docs/concepts/services-networking/network-policies/
+      - https://kubernetes.io/docs/concepts/security/security-checklist/
+    tasks:
+      - text: "Create NetworkPolicy `quarantine` in `webapp` that denies all ingress AND all egress for pods labelled `app=compromised`."
+      - text: "Delete the ClusterRoleBinding that gives the `webapp:app-sa` ServiceAccount cluster-wide Secret access."
+      - text: "Record what you found in ConfigMap `forensics` in `webapp`: key `sa` = the ServiceAccount name, key `binding` = the ClusterRoleBinding you removed, key `escalation` = `secrets`."
+      - text: "Delete the `compromised` pod and deploy a hardened replacement Pod `webapp/clean`: non-root, read-only root filesystem, all capabilities dropped, no ServiceAccount token."
+      - text: "The clean pod must be Running, and `app-sa` must no longer be able to read Secrets."
+    setup:
+      - kind: shell
+        desc: stage a compromised, over-privileged workload
+        timeout: 420
+        run: |
+          kubectl create ns webapp
+          kubectl -n webapp create serviceaccount app-sa
+          kubectl create clusterrole secret-reader-all --verb=get,list --resource=secrets
+          kubectl create clusterrolebinding app-sa-secrets \
+            --clusterrole=secret-reader-all --serviceaccount=webapp:app-sa
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: compromised, namespace: webapp, labels: {app: compromised}}
+          spec:
+            serviceAccountName: app-sa
+            containers:
+              - name: c
+                image: curlimages/curl:8.10.1
+                command: ["sleep", "86400"]
+                securityContext:
+                  privileged: true
+          YAML
+          kubectl -n webapp wait --for=condition=Ready pod/compromised --timeout=300s
+    verify:
+      - id: quarantine
+        desc: A NetworkPolicy quarantines the compromised workload both ways
+        points: 25
+        hint: "podSelector on app=compromised with policyTypes [Ingress, Egress] and no rules"
+        run: |
+          eq "$(jp netpol quarantine '{.spec.podSelector.matchLabels.app}' -n webapp)" "compromised" || exit 1
+          t=$(jp netpol quarantine '{.spec.policyTypes[*]}' -n webapp)
+          echo "$t" | grep -q Ingress || exit 1
+          echo "$t" | grep -q Egress || exit 1
+          ing=$(jp netpol quarantine '{.spec.ingress}' -n webapp)
+          eg=$(jp netpol quarantine '{.spec.egress}' -n webapp)
+          { [ -z "$ing" ] || [ "$ing" = "[]" ]; } && { [ -z "$eg" ] || [ "$eg" = "[]" ]; }
+      - id: rbac-revoked
+        desc: The over-broad ClusterRoleBinding is gone
+        points: 25
+        hint: "kubectl get clusterrolebindings | grep app-sa"
+        run: |
+          ! kubectl get clusterrolebinding app-sa-secrets >/dev/null 2>&1 || exit 1
+          kubectl auth can-i list secrets --as=system:serviceaccount:webapp:app-sa -A 2>/dev/null \
+            | grep -qx no
+      - id: forensics
+        desc: You recorded the identity, the binding and what it could reach
+        points: 20
+        hint: "kubectl auth can-i --list --as=system:serviceaccount:webapp:app-sa"
+        run: |
+          eq "$(jp cm forensics '{.data.sa}' -n webapp | tr -d ' ')" "app-sa" || exit 1
+          eq "$(jp cm forensics '{.data.binding}' -n webapp | tr -d ' ')" "app-sa-secrets" || exit 1
+          eq "$(jp cm forensics '{.data.escalation}' -n webapp | tr -d ' ')" "secrets"
+      - id: evicted
+        desc: The compromised pod has been removed
+        points: 15
+        hint: "only after you have contained and investigated"
+        run: |
+          ! kubectl -n webapp get pod compromised >/dev/null 2>&1
+      - id: replacement
+        desc: A hardened replacement pod is Running
+        points: 15
+        hint: "non-root, read-only root, drop ALL, automountServiceAccountToken false"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n webapp get pod clean -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          eq "$(jp pod clean '{.spec.securityContext.runAsNonRoot}' -n webapp)" "true" || exit 1
+          c='.spec.containers[0].securityContext'
+          eq "$(jp pod clean "{$c.readOnlyRootFilesystem}" -n webapp)" "true" || exit 1
+          jp pod clean "{$c.capabilities.drop[*]}" -n webapp | grep -q ALL || exit 1
+          eq "$(jp pod clean '{.spec.automountServiceAccountToken}' -n webapp)" "false" || exit 1
+          p=$(jp pod clean "{$c.privileged}" -n webapp)
+          [ "$p" != "true" ]
+    hints:
+      - title: Containment first
+        cost: 12
+        text: |
+          ```yaml
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: webapp}
+          spec:
+            podSelector:
+              matchLabels:
+                app: compromised
+            policyTypes: ["Ingress", "Egress"]
+          ```
+          No `ingress` or `egress` rules at all means deny in both
+          directions. The pod keeps running - which is what you want while
+          you look at it - but it can no longer talk to anything.
+      - title: Investigate the identity
+        cost: 12
+        text: |
+          ```
+          kubectl -n webapp get pod compromised -o jsonpath='{.spec.serviceAccountName}'
+          kubectl auth can-i --list --as=system:serviceaccount:webapp:app-sa
+          kubectl get clusterrolebindings -o custom-columns=\
+          NAME:.metadata.name,ROLE:.roleRef.name,SUBJECT:.subjects[*].name | grep app-sa
+          ```
+          Assume everything that identity could read has been read. That is
+          what goes in the incident report.
+      - title: Then evict and replace
+        cost: 12
+        text: |
+          ```
+          kubectl delete clusterrolebinding app-sa-secrets
+          kubectl -n webapp delete pod compromised
+
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: clean, namespace: webapp, labels: {app: clean}}
+          spec:
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65532
+              seccompProfile: {type: RuntimeDefault}
+            containers:
+              - name: c
+                image: registry.k8s.io/pause:3.9
+                securityContext:
+                  readOnlyRootFilesystem: true
+                  allowPrivilegeEscalation: false
+                  capabilities: {drop: ["ALL"]}
+          YAML
+          ```
+      - title: What a real postmortem would also cover
+        cost: 10
+        text: |
+          Rotate every Secret that identity could read, check the audit log
+          for what it actually requested, look for anything it created
+          (pods, bindings, CronJobs), and add a Pod Security Admission label
+          so a privileged pod cannot be created in that namespace again.
+    solution: |
+      ```bash
+      # 1. contain the network
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: quarantine, namespace: webapp}
+      spec:
+        podSelector:
+          matchLabels:
+            app: compromised
+        policyTypes: ["Ingress", "Egress"]
+      YAML
+
+      # 2. investigate before destroying evidence
+      kubectl -n webapp get pod compromised -o jsonpath='{.spec.serviceAccountName}'
+      kubectl auth can-i --list --as=system:serviceaccount:webapp:app-sa
+      kubectl get clusterrolebindings | grep app-sa
+
+      kubectl -n webapp create configmap forensics \
+        --from-literal=sa=app-sa \
+        --from-literal=binding=app-sa-secrets \
+        --from-literal=escalation=secrets
+
+      # 3. revoke and evict
+      kubectl delete clusterrolebinding app-sa-secrets
+      kubectl -n webapp delete pod compromised
+
+      # 4. replace with something hardened
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: clean, namespace: webapp, labels: {app: clean}}
+      spec:
+        automountServiceAccountToken: false
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            securityContext:
+              readOnlyRootFilesystem: true
+              allowPrivilegeEscalation: false
+              capabilities: {drop: ["ALL"]}
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: quarantine, namespace: webapp}
+      spec:
+        podSelector:
+          matchLabels: {app: compromised}
+        policyTypes: ["Ingress", "Egress"]
+      YAML
+      kubectl -n webapp create configmap forensics \
+        --from-literal=sa=app-sa --from-literal=binding=app-sa-secrets --from-literal=escalation=secrets
+      kubectl delete clusterrolebinding app-sa-secrets
+      kubectl -n webapp delete pod compromised --wait=true
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: clean, namespace: webapp, labels: {app: clean}}
+      spec:
+        automountServiceAccountToken: false
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            securityContext:
+              readOnlyRootFilesystem: true
+              allowPrivilegeEscalation: false
+              capabilities: {drop: ["ALL"]}
+      YAML
+      kubectl -n webapp wait --for=condition=Ready pod/clean --timeout=300s

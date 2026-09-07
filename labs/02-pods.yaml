@@ -1,0 +1,985 @@
+category: Pods & Containers
+labs:
+
+  - id: pod-multi-container
+    title: Sidecar pattern - two containers, one volume
+    difficulty: easy
+    exams: [KCNA, CKAD]
+    concepts: [pods, sidecar, emptyDir, multi-container]
+    par_minutes: 10
+    estimated_minutes: 14
+    blurb: A writer and a reader sharing an emptyDir - the shape of most sidecars.
+    scenario: |
+      Containers in the same pod share a network namespace and can share
+      volumes. That is the whole basis of the sidecar pattern: a main
+      container does the work, a helper container ships logs, refreshes
+      certs or proxies traffic.
+
+      Build the simplest honest version of it: one container writes a
+      heartbeat to a shared volume, another reads it back.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/pods/
+      - https://kubernetes.io/docs/concepts/storage/volumes/#emptydir
+    tasks:
+      - text: "In namespace `side`, create a Pod `heartbeat` with two containers."
+      - text: "Container `writer` (`busybox:1.36`) appends a line to `/shared/beat.log` every second, forever."
+      - text: "Container `reader` (`busybox:1.36`) tails `/shared/beat.log` so the lines show up in its logs."
+      - text: "Both containers mount the same `emptyDir` volume named `shared` at `/shared`."
+    setup:
+      - kind: shell
+        desc: create the side namespace
+        run: kubectl create ns side
+    verify:
+      - id: two-containers
+        desc: Pod side/heartbeat has containers named writer and reader
+        points: 20
+        hint: "two entries under spec.containers, named writer and reader"
+        run: |
+          names=$(jp pod heartbeat '{.spec.containers[*].name}' -n side | tr ' ' '\n' | sort | tr '\n' ' ')
+          eq "$names" "reader writer "
+      - id: shared-volume
+        desc: An emptyDir volume named shared is mounted at /shared in both containers
+        points: 25
+        hint: "spec.volumes: [{name: shared, emptyDir: {}}] plus volumeMounts in each container"
+        run: |
+          jp pod heartbeat '{.spec.volumes[?(@.name=="shared")].emptyDir}' -n side | grep -q '{' || exit 1
+          n=$(jp pod heartbeat '{.spec.containers[*].volumeMounts[?(@.name=="shared")].mountPath}' -n side \
+                | tr ' ' '\n' | grep -c '^/shared$')
+          [ "$n" -eq 2 ]
+      - id: running
+        desc: The pod reaches Running with both containers ready
+        points: 25
+        hint: "kubectl -n side get pod heartbeat -- if it is CrashLooping, check your command syntax"
+        run: |
+          retry bash -c '[ "$(kubectl -n side get pod heartbeat -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          ready=$(jp pod heartbeat '{.status.containerStatuses[*].ready}' -n side)
+          eq "$ready" "true true"
+      - id: data-flows
+        desc: The reader's logs contain what the writer wrote
+        points: 30
+        hint: "kubectl -n side logs heartbeat -c reader"
+        run: |
+          retry bash -c 'kubectl -n side logs heartbeat -c reader --tail=20 2>/dev/null | grep -q .'
+          kubectl -n side logs heartbeat -c reader --tail=50 | grep -q .
+    hints:
+      - title: Making a container loop forever
+        cost: 8
+        text: |
+          busybox has no shell loop by default in `args`, so give it one:
+
+          ```yaml
+          command: ["sh", "-c"]
+          args: ["while true; do date >> /shared/beat.log; sleep 1; done"]
+          ```
+
+          For the reader, `tail -F /shared/beat.log` keeps running and keeps
+          printing - use `-F` not `-f` so it copes with the file appearing late.
+      - title: Volume wiring
+        cost: 10
+        text: |
+          The volume is declared once on the pod and mounted once per
+          container:
+
+          ```yaml
+          spec:
+            volumes:
+              - name: shared
+                emptyDir: {}
+            containers:
+              - name: writer
+                volumeMounts:
+                  - name: shared
+                    mountPath: /shared
+          ```
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: heartbeat
+        namespace: side
+      spec:
+        volumes:
+          - name: shared
+            emptyDir: {}
+        containers:
+          - name: writer
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do date >> /shared/beat.log; sleep 1; done"]
+            volumeMounts:
+              - name: shared
+                mountPath: /shared
+          - name: reader
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["tail -F /shared/beat.log"]
+            volumeMounts:
+              - name: shared
+                mountPath: /shared
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: heartbeat
+        namespace: side
+      spec:
+        volumes:
+          - name: shared
+            emptyDir: {}
+        containers:
+          - name: writer
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["while true; do date >> /shared/beat.log; sleep 1; done"]
+            volumeMounts: [{name: shared, mountPath: /shared}]
+          - name: reader
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["tail -F /shared/beat.log"]
+            volumeMounts: [{name: shared, mountPath: /shared}]
+      YAML
+      kubectl -n side wait --for=condition=Ready pod/heartbeat --timeout=120s
+      sleep 5
+
+  - id: pod-init-containers
+    title: Init containers - do not start until the world is ready
+    difficulty: easy
+    exams: [CKAD, CKA]
+    concepts: [init containers, pods, startup ordering]
+    par_minutes: 10
+    estimated_minutes: 13
+    blurb: Gate an app on a dependency, and watch a pod sit in Init until it is met.
+    scenario: |
+      Init containers run to completion, in order, before any app container
+      starts. They are the right tool for "wait for the database", "fetch
+      config", or "fix permissions on a volume".
+
+      The `web` pod below must not start until a Service called `db` exists
+      and resolves. Right now that Service does not exist, so once you add
+      the init container the pod should sit in `Init:0/1` - and then start
+      the moment you create the Service.
+
+      One trap worth meeting now rather than in the exam: busybox `nslookup`
+      on a short name queries every DNS search domain and returns non-zero
+      if any of them misses, so `until nslookup db` can loop forever even
+      after the Service exists. Query the fully qualified name instead:
+      `db.initns.svc.cluster.local`.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/pods/init-containers/
+    tasks:
+      - text: "In namespace `initns`, create a Pod `web` running `nginx:1.27-alpine`."
+      - text: "Give it an init container `wait-db` (`busybox:1.36`) that loops until `nslookup db.initns.svc.cluster.local` succeeds."
+      - text: "Create a Service `db` in `initns` (ClusterIP, port 5432) so DNS resolves and the pod can finally start."
+      - text: "The pod must end up Running."
+    setup:
+      - kind: shell
+        desc: create the initns namespace
+        run: kubectl create ns initns
+    verify:
+      - id: init-present
+        desc: Pod initns/web has an init container called wait-db
+        points: 30
+        hint: "spec.initContainers is a separate list from spec.containers"
+        run: |
+          eq "$(jp pod web '{.spec.initContainers[0].name}' -n initns)" "wait-db"
+      - id: init-waits
+        desc: The init container really gates on DNS for db
+        points: 20
+        hint: 'args like: until nslookup db.initns.svc.cluster.local; do sleep 2; done'
+        run: |
+          jp pod web '{.spec.initContainers[0].command} {.spec.initContainers[0].args}' -n initns \
+            | grep -q 'nslookup'
+      - id: service
+        desc: Service initns/db exists on port 5432
+        points: 20
+        hint: "kubectl -n initns create service clusterip db --tcp=5432:5432"
+        run: |
+          eq "$(jp svc db '{.spec.ports[0].port}' -n initns)" "5432"
+      - id: running
+        desc: The web pod got past init and is Running
+        points: 30
+        hint: "kubectl -n initns get pod web -w -- it unblocks within a few seconds of the Service existing"
+        run: |
+          RETRY=30 retry bash -c '[ "$(kubectl -n initns get pod web -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: The waiting loop
+        cost: 8
+        text: |
+          ```yaml
+          initContainers:
+            - name: wait-db
+              image: busybox:1.36
+              command: ["sh", "-c"]
+              args: ["until nslookup db.initns.svc.cluster.local; do sleep 2; done"]
+          ```
+      - title: Creating the Service without a Deployment
+        cost: 8
+        text: |
+          A Service does not need endpoints to exist for DNS to resolve:
+
+          ```
+          kubectl -n initns create service clusterip db --tcp=5432:5432
+          ```
+      - title: Watching it happen
+        cost: 6
+        text: |
+          `kubectl -n initns get pod web -w` shows `Init:0/1` then `Running`.
+          `kubectl -n initns logs web -c wait-db` shows the init container's
+          own output.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: web
+        namespace: initns
+      spec:
+        initContainers:
+          - name: wait-db
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["until nslookup db.initns.svc.cluster.local; do sleep 2; done"]
+        containers:
+          - name: web
+            image: nginx:1.27-alpine
+      YAML
+
+      kubectl -n initns create service clusterip db --tcp=5432:5432
+      kubectl -n initns wait --for=condition=Ready pod/web --timeout=120s
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: web
+        namespace: initns
+      spec:
+        initContainers:
+          - name: wait-db
+            image: busybox:1.36
+            command: ["sh", "-c"]
+            args: ["until nslookup db.initns.svc.cluster.local; do sleep 2; done"]
+        containers:
+          - name: web
+            image: nginx:1.27-alpine
+      YAML
+      kubectl -n initns create service clusterip db --tcp=5432:5432
+      kubectl -n initns wait --for=condition=Ready pod/web --timeout=150s
+
+  - id: pod-probes
+    title: Liveness, readiness and startup probes
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [probes, health checks, readiness, liveness]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: Three probes, three different jobs. Mixing them up causes real outages.
+    scenario: |
+      A Deployment `checkout` is in the cluster with no health checking at
+      all. When it wedges, traffic keeps being sent to it; when it is still
+      warming up, traffic arrives too early.
+
+      Add all three probe types and understand the difference:
+
+      - **readiness** decides whether the pod receives Service traffic
+      - **liveness** decides whether the kubelet restarts the container
+      - **startup** gives a slow starter time before liveness kicks in
+
+      The image serves HTTP on port 80 and `/` returns 200.
+    docs:
+      - https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+    tasks:
+      - text: "Add a readiness probe to `checkout`: HTTP GET `/` on port 80, initial delay 3s, period 5s."
+      - text: "Add a liveness probe: HTTP GET `/` on port 80, period 10s, failureThreshold 3."
+      - text: "Add a startup probe: HTTP GET `/` on port 80, period 5s, failureThreshold 12 (so it gets up to a minute to boot)."
+      - text: "The Deployment must roll out and report all replicas ready."
+    setup:
+      - kind: shell
+        desc: deploy an unhealthy-by-omission checkout service
+        run: |
+          kubectl create ns shop
+          kubectl -n shop create deployment checkout --image=nginx:1.27-alpine --replicas=2 --port=80
+          kubectl -n shop rollout status deploy/checkout --timeout=120s
+    verify:
+      - id: readiness
+        desc: Readiness probe is an HTTP GET on port 80 with the right timings
+        points: 25
+        hint: "kubectl -n shop edit deploy checkout, then readinessProbe under the container"
+        run: |
+          p='.spec.template.spec.containers[0].readinessProbe'
+          eq "$(jp deploy checkout "{$p.httpGet.port}" -n shop)" "80" || exit 1
+          eq "$(jp deploy checkout "{$p.httpGet.path}" -n shop)" "/" || exit 1
+          eq "$(jp deploy checkout "{$p.initialDelaySeconds}" -n shop)" "3" || exit 1
+          eq "$(jp deploy checkout "{$p.periodSeconds}" -n shop)" "5"
+      - id: liveness
+        desc: Liveness probe is an HTTP GET with period 10 and failureThreshold 3
+        points: 25
+        hint: "livenessProbe is a sibling of readinessProbe"
+        run: |
+          p='.spec.template.spec.containers[0].livenessProbe'
+          eq "$(jp deploy checkout "{$p.httpGet.port}" -n shop)" "80" || exit 1
+          eq "$(jp deploy checkout "{$p.periodSeconds}" -n shop)" "10" || exit 1
+          eq "$(jp deploy checkout "{$p.failureThreshold}" -n shop)" "3"
+      - id: startup
+        desc: Startup probe has period 5 and failureThreshold 12
+        points: 25
+        hint: "startupProbe suspends liveness until it first succeeds"
+        run: |
+          p='.spec.template.spec.containers[0].startupProbe'
+          eq "$(jp deploy checkout "{$p.httpGet.port}" -n shop)" "80" || exit 1
+          eq "$(jp deploy checkout "{$p.periodSeconds}" -n shop)" "5" || exit 1
+          eq "$(jp deploy checkout "{$p.failureThreshold}" -n shop)" "12"
+      - id: healthy
+        desc: Both replicas are running the probed template and are Ready
+        points: 25
+        hint: "kubectl -n shop rollout status deploy/checkout -- the probe edit starts a new rollout"
+        run: |
+          rollout shop deploy/checkout 180s || exit 1
+          eq "$(jp deploy checkout '{.status.readyReplicas}' -n shop)" "2" || exit 1
+          n=$(kubectl -n shop get pods -l app=checkout \
+                -o jsonpath='{range .items[*]}{.spec.containers[0].readinessProbe.httpGet.port}{"\n"}{end}' \
+                | grep -c '^80$')
+          [ "$n" -eq 2 ]
+      - id: no-restarts
+        desc: No container is restart-looping (your liveness probe is not too aggressive)
+        points: 0
+        hint: "if restarts climb, your liveness probe is failing - check the path and port"
+        run: |
+          total=$(kubectl -n shop get pods -l app=checkout \
+            -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
+            | awk '{s+=$1} END {print s+0}')
+          [ "${total:-0}" -le 2 ]
+    hints:
+      - title: Where the probes go
+        cost: 8
+        text: |
+          All three are fields on the *container*, not the pod:
+
+          ```yaml
+          containers:
+            - name: nginx
+              image: nginx:1.27-alpine
+              readinessProbe:
+                httpGet: {path: /, port: 80}
+                initialDelaySeconds: 3
+                periodSeconds: 5
+          ```
+      - title: Editing an existing Deployment
+        cost: 8
+        text: |
+          `kubectl -n shop edit deploy checkout` opens the live object in
+          $EDITOR. Saving triggers a rollout. If you prefer files:
+
+          ```
+          kubectl -n shop get deploy checkout -o yaml > checkout.yaml
+          vi checkout.yaml && kubectl apply -f checkout.yaml
+          ```
+      - title: What each probe actually does
+        cost: 12
+        text: |
+          - readiness failing -> pod removed from Service endpoints, not restarted
+          - liveness failing (failureThreshold times in a row) -> container restarted
+          - startup probe present -> liveness and readiness are held off until it passes once
+
+          A liveness probe that is too aggressive turns a slow start into a
+          crash loop. That is why startupProbe exists.
+    solution: |
+      ```bash
+      kubectl -n shop patch deployment checkout --type=strategic -p '
+      spec:
+        template:
+          spec:
+            containers:
+              - name: nginx
+                readinessProbe:
+                  httpGet: {path: /, port: 80}
+                  initialDelaySeconds: 3
+                  periodSeconds: 5
+                livenessProbe:
+                  httpGet: {path: /, port: 80}
+                  periodSeconds: 10
+                  failureThreshold: 3
+                startupProbe:
+                  httpGet: {path: /, port: 80}
+                  periodSeconds: 5
+                  failureThreshold: 12
+      '
+      kubectl -n shop rollout status deploy/checkout
+      ```
+
+      Note the container is named `nginx` (that is what
+      `kubectl create deployment --image=nginx:1.27-alpine` names it), and a
+      strategic merge patch matches list entries by name.
+    solve_script: |
+      kubectl -n shop patch deployment checkout --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"nginx","readinessProbe":{"httpGet":{"path":"/","port":80},"initialDelaySeconds":3,"periodSeconds":5},"livenessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":10,"failureThreshold":3},"startupProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":5,"failureThreshold":12}}]}}}}'
+      kubectl -n shop rollout status deploy/checkout --timeout=180s
+
+  - id: pod-resources-qos
+    title: Requests, limits and the three QoS classes
+    difficulty: medium
+    exams: [KCNA, CKA, CKAD]
+    concepts: [resources, requests, limits, qos, scheduling]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: Produce a Guaranteed, a Burstable and a BestEffort pod on purpose.
+    scenario: |
+      Kubernetes derives a pod's Quality of Service class from its resource
+      requests and limits, and that class decides who gets evicted first
+      when a node runs out of memory.
+
+      - **Guaranteed**: every container sets requests == limits for both cpu and memory
+      - **Burstable**: at least one request or limit is set, but not that rule
+      - **BestEffort**: nothing set at all
+
+      Build one of each, deliberately, in the `qos` namespace.
+    docs:
+      - https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/
+      - https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+    tasks:
+      - text: "Pod `gtd` in `qos`: image `registry.k8s.io/pause:3.9`, cpu and memory requests equal to its limits (100m / 128Mi)."
+      - text: "Pod `burst` in `qos`: a memory request of 64Mi and a memory limit of 128Mi."
+      - text: "Pod `besteffort` in `qos`: no resource requests or limits at all."
+      - text: "Record the assigned QoS class of each pod in a ConfigMap `qosanswers` in `qos`, under keys `gtd`, `burst` and `besteffort`."
+    setup:
+      - kind: shell
+        desc: create the qos namespace
+        run: kubectl create ns qos
+    verify:
+      - id: guaranteed
+        desc: Pod qos/gtd is classified Guaranteed by the kubelet
+        points: 30
+        hint: "requests must equal limits for BOTH cpu and memory, on every container"
+        run: |
+          eq "$(jp pod gtd '{.status.qosClass}' -n qos)" "Guaranteed"
+      - id: burstable
+        desc: Pod qos/burst is classified Burstable
+        points: 25
+        hint: "set a memory request lower than the memory limit"
+        run: |
+          eq "$(jp pod burst '{.status.qosClass}' -n qos)" "Burstable"
+      - id: besteffort
+        desc: Pod qos/besteffort is classified BestEffort
+        points: 20
+        hint: "leave the resources block out entirely"
+        run: |
+          eq "$(jp pod besteffort '{.status.qosClass}' -n qos)" "BestEffort"
+      - id: answers
+        desc: The qosanswers ConfigMap records all three classes correctly
+        points: 25
+        hint: "kubectl -n qos get pod gtd -o jsonpath='{.status.qosClass}'"
+        run: |
+          for p in gtd burst besteffort; do
+            want=$(jp pod "$p" '{.status.qosClass}' -n qos)
+            got=$(jp cm qosanswers "{.data.$p}" -n qos | tr -d ' ')
+            [ -n "$want" ] || exit 1
+            eq "$got" "$want" || exit 1
+          done
+    hints:
+      - title: The Guaranteed rule is strict
+        cost: 8
+        text: |
+          For Guaranteed you need, on *every* container in the pod:
+
+          ```yaml
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits:   {cpu: 100m, memory: 128Mi}
+          ```
+
+          Miss cpu on either side and you drop to Burstable.
+      - title: Generating them quickly
+        cost: 10
+        text: |
+          ```
+          kubectl -n qos run gtd --image=registry.k8s.io/pause:3.9 \
+            --requests=cpu=100m,memory=128Mi --limits=cpu=100m,memory=128Mi
+          ```
+          Newer kubectl dropped `--requests`/`--limits` from `run`; if yours
+          has, generate with `$do`, edit the YAML, then apply.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: gtd, namespace: qos}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {cpu: 100m, memory: 128Mi}
+              limits:   {cpu: 100m, memory: 128Mi}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: burst, namespace: qos}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {memory: 64Mi}
+              limits:   {memory: 128Mi}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: besteffort, namespace: qos}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      YAML
+
+      kubectl -n qos create configmap qosanswers \
+        --from-literal=gtd=Guaranteed \
+        --from-literal=burst=Burstable \
+        --from-literal=besteffort=BestEffort
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: gtd, namespace: qos}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {cpu: 100m, memory: 128Mi}
+              limits: {cpu: 100m, memory: 128Mi}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: burst, namespace: qos}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {memory: 64Mi}
+              limits: {memory: 128Mi}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: besteffort, namespace: qos}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      YAML
+      kubectl -n qos wait --for=condition=Ready pod/gtd pod/burst pod/besteffort --timeout=120s
+      kubectl -n qos create configmap qosanswers \
+        --from-literal=gtd=Guaranteed --from-literal=burst=Burstable --from-literal=besteffort=BestEffort
+
+  - id: pod-downward-api
+    title: The downward API - a pod that knows about itself
+    difficulty: medium
+    exams: [CKAD]
+    concepts: [downward api, env vars, volumes, metadata]
+    par_minutes: 12
+    estimated_minutes: 15
+    blurb: Expose pod name, namespace, node and labels to the process inside.
+    scenario: |
+      Applications often need to know their own identity - to tag metrics,
+      to register with a discovery system, to write structured logs. The
+      downward API injects pod metadata as environment variables or as files
+      in a volume, without the app needing cluster access.
+
+      Build a pod that exposes its own metadata both ways.
+    docs:
+      - https://kubernetes.io/docs/tasks/inject-data-application/environment-variable-expose-pod-information/
+      - https://kubernetes.io/docs/tasks/inject-data-application/downward-api-volume-expose-pod-information/
+    tasks:
+      - text: "In namespace `meta`, create a Pod `whoami` (`busybox:1.36`, `sleep 3600`) with the label `team=platform`."
+      - text: "Expose env var `POD_NAME` from `metadata.name` and `POD_NAMESPACE` from `metadata.namespace`."
+      - text: "Expose env var `NODE_NAME` from `spec.nodeName`."
+      - text: "Mount a downward API volume at `/podinfo` containing a file `labels` with the pod's labels."
+    setup:
+      - kind: shell
+        desc: create the meta namespace
+        run: kubectl create ns meta
+    verify:
+      - id: env-name
+        desc: POD_NAME and POD_NAMESPACE come from the downward API
+        points: 30
+        hint: "valueFrom.fieldRef.fieldPath: metadata.name"
+        run: |
+          retry bash -c 'kubectl -n meta get pod whoami -o jsonpath="{.status.phase}" | grep -q Running'
+          out=$(kubectl -n meta exec whoami -- sh -c 'echo "$POD_NAME/$POD_NAMESPACE"' 2>/dev/null)
+          eq "$out" "whoami/meta"
+      - id: env-node
+        desc: NODE_NAME matches the node the pod is actually on
+        points: 25
+        hint: "fieldPath: spec.nodeName"
+        run: |
+          want=$(jp pod whoami '{.spec.nodeName}' -n meta)
+          got=$(kubectl -n meta exec whoami -- sh -c 'echo "$NODE_NAME"' 2>/dev/null | tr -d '\r')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: volume
+        desc: /podinfo/labels exists inside the container and contains the team label
+        points: 30
+        hint: "downwardAPI volume with items: [{path: labels, fieldRef: {fieldPath: metadata.labels}}]"
+        run: |
+          kubectl -n meta exec whoami -- cat /podinfo/labels 2>/dev/null | grep -q 'team="platform"'
+      - id: label
+        desc: The pod carries the team=platform label
+        points: 15
+        hint: "kubectl -n meta label pod whoami team=platform"
+        run: |
+          eq "$(jp pod whoami '{.metadata.labels.team}' -n meta)" "platform"
+    hints:
+      - title: Env var form
+        cost: 8
+        text: |
+          ```yaml
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ```
+          Only a subset of fields is allowed: `metadata.name`,
+          `metadata.namespace`, `metadata.uid`, `spec.nodeName`,
+          `spec.serviceAccountName`, `status.podIP`, `status.hostIP`.
+      - title: Volume form
+        cost: 10
+        text: |
+          `metadata.labels` and `metadata.annotations` can only come through
+          a volume, not an env var:
+
+          ```yaml
+          volumes:
+            - name: podinfo
+              downwardAPI:
+                items:
+                  - path: labels
+                    fieldRef:
+                      fieldPath: metadata.labels
+          ```
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: whoami
+        namespace: meta
+        labels:
+          team: platform
+      spec:
+        volumes:
+          - name: podinfo
+            downwardAPI:
+              items:
+                - path: labels
+                  fieldRef:
+                    fieldPath: metadata.labels
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            env:
+              - name: POD_NAME
+                valueFrom: {fieldRef: {fieldPath: metadata.name}}
+              - name: POD_NAMESPACE
+                valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+              - name: NODE_NAME
+                valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            volumeMounts:
+              - name: podinfo
+                mountPath: /podinfo
+      YAML
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: whoami
+        namespace: meta
+        labels: {team: platform}
+      spec:
+        volumes:
+          - name: podinfo
+            downwardAPI:
+              items:
+                - path: labels
+                  fieldRef: {fieldPath: metadata.labels}
+        containers:
+          - name: c
+            image: busybox:1.36
+            command: ["sleep", "3600"]
+            env:
+              - name: POD_NAME
+                valueFrom: {fieldRef: {fieldPath: metadata.name}}
+              - name: POD_NAMESPACE
+                valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+              - name: NODE_NAME
+                valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            volumeMounts: [{name: podinfo, mountPath: /podinfo}]
+      YAML
+      kubectl -n meta wait --for=condition=Ready pod/whoami --timeout=120s
+
+  - id: pod-lifecycle-hooks
+    title: Graceful shutdown - preStop hooks and termination grace
+    difficulty: medium
+    exams: [CKAD]
+    concepts: [lifecycle hooks, prestop, graceful shutdown, termination]
+    par_minutes: 11
+    estimated_minutes: 14
+    blurb: Stop dropping in-flight requests when a pod is deleted.
+    scenario: |
+      When a pod is deleted, two things happen in parallel: it is removed
+      from Service endpoints, and it gets SIGTERM. Those races are why
+      rolling updates drop requests.
+
+      The standard fix is a `preStop` hook that sleeps for a few seconds -
+      long enough for endpoint removal to propagate - plus a
+      `terminationGracePeriodSeconds` that is comfortably longer than the
+      hook.
+
+      Configure it on the `edge` Deployment.
+    docs:
+      - https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/
+      - https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/
+    tasks:
+      - text: "Add a `preStop` exec hook to the container in Deployment `graceful/edge` that runs `sleep 10`."
+      - text: "Set `terminationGracePeriodSeconds` to 45 on the pod template (the default is already 30, so 30 would prove nothing)."
+      - text: "Add a `postStart` exec hook that writes the word `started` to `/tmp/started`."
+      - text: "The Deployment must roll out cleanly afterwards."
+    setup:
+      - kind: shell
+        desc: deploy an edge service with no lifecycle handling
+        run: |
+          kubectl create ns graceful
+          kubectl -n graceful create deployment edge --image=nginx:1.27-alpine --replicas=2
+          kubectl -n graceful rollout status deploy/edge --timeout=120s
+    verify:
+      - id: prestop
+        desc: A preStop exec hook runs sleep 10
+        points: 30
+        hint: "lifecycle.preStop.exec.command on the container"
+        run: |
+          cmd=$(jp deploy edge '{.spec.template.spec.containers[0].lifecycle.preStop.exec.command}' -n graceful)
+          echo "$cmd" | grep -q 'sleep' && echo "$cmd" | grep -q '10'
+      - id: grace
+        desc: terminationGracePeriodSeconds is 45
+        points: 25
+        hint: "it lives on spec.template.spec, not on the container (the default is 30)"
+        run: |
+          eq "$(jp deploy edge '{.spec.template.spec.terminationGracePeriodSeconds}' -n graceful)" "45"
+      - id: poststart
+        desc: A postStart hook wrote /tmp/started inside the running container
+        points: 25
+        hint: "lifecycle.postStart.exec.command with sh -c 'echo started > /tmp/started'"
+        run: |
+          rollout graceful deploy/edge 150s
+          pod=$(kubectl -n graceful get pods -l app=edge -o name | head -1)
+          [ -n "$pod" ] || exit 1
+          kubectl -n graceful exec "$pod" -- cat /tmp/started 2>/dev/null | grep -q started
+      - id: rolled
+        desc: The running pods are the new ones and carry the preStop hook
+        points: 20
+        hint: "editing the pod template starts a rollout -- wait for it to finish"
+        run: |
+          rollout graceful deploy/edge 180s || exit 1
+          eq "$(jp deploy edge '{.status.readyReplicas}' -n graceful)" "2" || exit 1
+          n=$(kubectl -n graceful get pods -l app=edge \
+                -o jsonpath='{range .items[*]}{.spec.containers[0].lifecycle.preStop.exec.command}{"\n"}{end}' \
+                | grep -c 'sleep')
+          [ "$n" -eq 2 ]
+    hints:
+      - title: Hook shape
+        cost: 8
+        text: |
+          ```yaml
+          lifecycle:
+            postStart:
+              exec:
+                command: ["sh", "-c", "echo started > /tmp/started"]
+            preStop:
+              exec:
+                command: ["sleep", "10"]
+          ```
+      - title: Grace period placement
+        cost: 8
+        text: |
+          `terminationGracePeriodSeconds` is a *pod* field:
+
+          ```yaml
+          spec:
+            template:
+              spec:
+                terminationGracePeriodSeconds: 45
+                containers: [...]
+          ```
+          Keep it larger than your preStop sleep, or the kubelet SIGKILLs
+          mid-hook.
+    solution: |
+      ```bash
+      kubectl -n graceful patch deployment edge --type=strategic -p '
+      spec:
+        template:
+          spec:
+            terminationGracePeriodSeconds: 30
+            containers:
+              - name: nginx
+                lifecycle:
+                  postStart:
+                    exec:
+                      command: ["sh", "-c", "echo started > /tmp/started"]
+                  preStop:
+                    exec:
+                      command: ["sleep", "10"]
+      '
+      kubectl -n graceful rollout status deploy/edge
+      ```
+    solve_script: |
+      kubectl -n graceful patch deployment edge --type=strategic -p '{"spec":{"template":{"spec":{"terminationGracePeriodSeconds":45,"containers":[{"name":"nginx","lifecycle":{"postStart":{"exec":{"command":["sh","-c","echo started > /tmp/started"]}},"preStop":{"exec":{"command":["sleep","10"]}}}}]}}}}'
+      kubectl -n graceful rollout status deploy/edge --timeout=180s
+
+  - id: pod-static-pod
+    title: Create a static pod straight on a node
+    difficulty: hard
+    exams: [CKA]
+    concepts: [static pods, kubelet, nodes, mirror pods]
+    par_minutes: 12
+    estimated_minutes: 16
+    destructive: false
+    blurb: Drop a manifest in a directory on a node and watch the kubelet run it.
+    scenario: |
+      Static pods are managed by the kubelet directly, not by the scheduler
+      or any controller. Drop a manifest into the kubelet's static pod
+      directory and it runs; delete the file and it stops. The API server
+      only ever sees a read-only *mirror pod*.
+
+      This is a classic CKA task, and the trap is that people try to fix it
+      with `kubectl` when the answer is on the node's filesystem.
+
+      Use `knode` to get onto the control plane node.
+    docs:
+      - https://kubernetes.io/docs/tasks/configure-pod-container/static-pod/
+    tasks:
+      - text: "Create a static pod named `nginx-static` on the control plane node, running image `nginx:1.27-alpine`."
+      - text: "Put it in the `kube-system` namespace - a manifest with no `metadata.namespace` lands in `default`."
+      - text: "Its mirror pod must appear in `kube-system` and reach Running."
+      - text: "Prove you understand it is static: record the manifest's full path in a ConfigMap `staticinfo` in `klab`, key `path`."
+    setup:
+      - kind: shell
+        desc: prepare the klab namespace
+        run: kubectl create ns klab --dry-run=client -o yaml | kubectl apply -f -
+    verify:
+      - id: mirror
+        desc: A mirror pod for nginx-static is Running in kube-system
+        points: 40
+        hint: "kubectl -n kube-system get pods | grep nginx-static -- the node name is appended"
+        run: |
+          RETRY=30 retry bash -c '
+            kubectl -n kube-system get pods -o name | grep -q "nginx-static" &&
+            kubectl -n kube-system get pods -o jsonpath="{range .items[*]}{.metadata.name} {.status.phase}{\"\n\"}{end}" \
+              | grep nginx-static | grep -q Running'
+      - id: is-static
+        desc: It really is a static pod (owned by the Node, not a controller)
+        points: 30
+        hint: "static pods have an ownerReference of kind Node and the config.hash annotation"
+        run: |
+          name=$(kubectl -n kube-system get pods -o name | grep nginx-static | head -1 | cut -d/ -f2)
+          [ -n "$name" ] || exit 1
+          eq "$(jp pod "$name" '{.metadata.ownerReferences[0].kind}' -n kube-system)" "Node"
+      - id: right-image
+        desc: The static pod runs nginx:1.27-alpine
+        points: 15
+        hint: "check the image in the manifest you wrote on the node"
+        run: |
+          name=$(kubectl -n kube-system get pods -o name | grep nginx-static | head -1 | cut -d/ -f2)
+          jp pod "$name" '{.spec.containers[0].image}' -n kube-system | grep -q 'nginx:1.27-alpine'
+      - id: path
+        desc: You recorded the manifest path correctly
+        points: 15
+        hint: "the directory is /etc/kubernetes/manifests"
+        run: |
+          got=$(jp cm staticinfo '{.data.path}' -n klab | tr -d ' ')
+          echo "$got" | grep -q '^/etc/kubernetes/manifests/.*\.ya\?ml$'
+    hints:
+      - title: Getting the manifest onto the node
+        cost: 8
+        text: |
+          ```
+          knode                                    # find the control-plane node name
+          knode kubestronaut-control-plane
+          # then, inside:
+          cd /etc/kubernetes/manifests
+          ```
+          Or generate it from outside and pipe it in:
+          `kubectl run nginx-static --image=nginx:1.27-alpine $do`
+      - title: Writing the file without an editor
+        cost: 10
+        text: |
+          kind node images have no vi. Use a heredoc through docker exec:
+
+          ```
+          docker exec -i kubestronaut-control-plane \
+            sh -c 'cat > /etc/kubernetes/manifests/nginx-static.yaml' <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: nginx-static
+            namespace: kube-system
+          spec:
+            containers:
+              - name: nginx
+                image: nginx:1.27-alpine
+          YAML
+          ```
+      - title: Why the name has a suffix
+        cost: 8
+        text: |
+          The kubelet names the mirror pod `<manifest-name>-<node-name>`, so
+          you will see `nginx-static-kubestronaut-control-plane`. Deleting
+          that pod with kubectl does nothing lasting - the kubelet recreates
+          it from the file.
+    solution: |
+      ```bash
+      docker exec -i kubestronaut-control-plane \
+        sh -c 'cat > /etc/kubernetes/manifests/nginx-static.yaml' <<'YAML'
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: nginx-static
+        namespace: kube-system
+      spec:
+        containers:
+          - name: nginx
+            image: nginx:1.27-alpine
+      YAML
+
+      kubectl -n kube-system get pods | grep nginx-static
+
+      kubectl -n klab create configmap staticinfo \
+        --from-literal=path=/etc/kubernetes/manifests/nginx-static.yaml
+      ```
+
+      To remove a static pod you delete the file, not the pod.
+    solve_script: |
+      docker exec -i kubestronaut-control-plane \
+        sh -c 'cat > /etc/kubernetes/manifests/nginx-static.yaml' <<'YAML'
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: nginx-static
+        namespace: kube-system
+      spec:
+        containers:
+          - name: nginx
+            image: nginx:1.27-alpine
+      YAML
+      sleep 25
+      kubectl -n klab create configmap staticinfo \
+        --from-literal=path=/etc/kubernetes/manifests/nginx-static.yaml

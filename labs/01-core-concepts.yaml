@@ -1,0 +1,766 @@
+category: Core Concepts & Architecture
+labs:
+
+  - id: core-explore-cluster
+    title: First contact - map out the cluster you were given
+    difficulty: intro
+    exams: [KCNA, CKA]
+    concepts: [kubectl, cluster architecture, control plane, namespaces]
+    par_minutes: 8
+    estimated_minutes: 12
+    blurb: Learn to read a cluster you have never seen before and record what you find.
+    scenario: |
+      You have just been handed kubeconfig access to a cluster and nobody
+      wrote any documentation. Before you can fix anything you need to know
+      what you are looking at.
+
+      Everything you discover goes into a ConfigMap called `answers` in the
+      `klab` namespace. That is how this lab is graded, and it is also a
+      habit worth having: write findings down.
+
+      Each answer is a key on the ConfigMap. You can build it in one go:
+
+      ```
+      kubectl create ns klab
+      kubectl -n klab create configmap answers \
+        --from-literal=nodes=<number> \
+        --from-literal=...
+      ```
+    docs:
+      - https://kubernetes.io/docs/reference/kubectl/quick-reference/
+      - https://kubernetes.io/docs/concepts/overview/components/
+    tasks:
+      - text: Create a namespace called `klab`.
+      - text: "Create a ConfigMap `answers` in `klab` with key `nodes` = the number of nodes in the cluster."
+      - text: "Add key `namespaces` = the number of namespaces that exist."
+      - text: "Add key `apiserver` = the name of the pod running the API server in `kube-system`."
+      - text: "Add key `cni` = the name of the DaemonSet providing pod networking in `kube-system`."
+    verify:
+      - id: ns
+        desc: The klab namespace exists
+        points: 10
+        hint: kubectl create ns klab
+        run: |
+          has ns klab
+      - id: nodes
+        desc: answers/nodes matches the real node count
+        points: 20
+        hint: "kubectl get nodes --no-headers | wc -l"
+        run: |
+          want=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+          got=$(jp cm answers '{.data.nodes}' -n klab | tr -d ' ')
+          eq "$got" "$want"
+      - id: namespaces
+        desc: answers/namespaces matches the real namespace count
+        points: 20
+        hint: "kubectl get ns --no-headers | wc -l"
+        run: |
+          want=$(kubectl get ns --no-headers | wc -l | tr -d ' ')
+          got=$(jp cm answers '{.data.namespaces}' -n klab | tr -d ' ')
+          eq "$got" "$want"
+      - id: apiserver
+        desc: answers/apiserver names the real API server pod
+        points: 25
+        hint: "kubectl -n kube-system get pods | grep apiserver"
+        run: |
+          got=$(jp cm answers '{.data.apiserver}' -n klab | tr -d ' ')
+          [ -n "$got" ] || exit 1
+          kubectl -n kube-system get pod "$got" -o name | grep -q apiserver
+      - id: cni
+        desc: answers/cni names a DaemonSet that really provides pod networking
+        points: 25
+        hint: "kubectl -n kube-system get daemonset"
+        run: |
+          got=$(jp cm answers '{.data.cni}' -n klab | tr -d ' ')
+          [ -n "$got" ] || exit 1
+          has ds "$got" -n kube-system
+          echo "$got" | grep -Eq 'kindnet|calico|cilium|flannel|weave'
+    hints:
+      - title: Where do I even start
+        cost: 6
+        text: |
+          `kubectl get nodes`, `kubectl get ns`, and
+          `kubectl -n kube-system get pods,daemonsets` answer all four
+          questions. `--no-headers | wc -l` turns a listing into a count.
+      - title: Building the ConfigMap
+        cost: 10
+        text: |
+          You can pass several literals at once, and shell substitution
+          works inside them:
+
+          ```
+          kubectl -n klab create configmap answers \
+            --from-literal=nodes=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+          ```
+
+          If you get it wrong, `kubectl -n klab delete cm answers` and try again.
+    solution: |
+      ```bash
+      kubectl create ns klab
+
+      NODES=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+      NSCOUNT=$(kubectl get ns --no-headers | wc -l | tr -d ' ')
+      APISERVER=$(kubectl -n kube-system get pods -o name | grep apiserver | head -1 | cut -d/ -f2)
+      CNI=$(kubectl -n kube-system get ds -o name | head -1 | cut -d/ -f2)
+
+      kubectl -n klab create configmap answers \
+        --from-literal=nodes=$NODES \
+        --from-literal=namespaces=$NSCOUNT \
+        --from-literal=apiserver=$APISERVER \
+        --from-literal=cni=$CNI
+      ```
+    solve_script: |
+      kubectl create ns klab
+      NODES=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+      NSCOUNT=$(kubectl get ns --no-headers | wc -l | tr -d ' ')
+      APISERVER=$(kubectl -n kube-system get pods -o name | grep apiserver | head -1 | cut -d/ -f2)
+      CNI=$(kubectl -n kube-system get ds -o name | grep -E 'kindnet|calico|cilium|flannel|weave' | head -1 | cut -d/ -f2)
+      kubectl -n klab create configmap answers \
+        --from-literal=nodes=$NODES \
+        --from-literal=namespaces=$NSCOUNT \
+        --from-literal=apiserver=$APISERVER \
+        --from-literal=cni=$CNI
+
+  - id: core-namespaces
+    title: Namespaces, contexts and where things actually live
+    difficulty: easy
+    exams: [KCNA, CKA, CKAD]
+    concepts: [namespaces, kubectl, contexts]
+    par_minutes: 7
+    estimated_minutes: 10
+    blurb: Create namespaces, move your default context, and find a resource someone hid.
+    scenario: |
+      The platform team wants three environments split by namespace, and
+      somewhere in this cluster there is already a Deployment called
+      `hidden-app` that nobody can find.
+
+      Namespaces are the first thing to get right - most "my resource
+      disappeared" tickets are really "you were looking in the wrong
+      namespace".
+    docs:
+      - https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+    tasks:
+      - text: Create namespaces `dev`, `staging` and `prod`.
+      - text: "Find the namespace that contains the Deployment `hidden-app`, and record it in a ConfigMap `found` in `dev` under key `namespace`."
+      - text: "Set your kubectl context's default namespace to `dev` so that a bare `kubectl get pods` looks there."
+      - text: "Label the `prod` namespace with `tier=critical`."
+    setup:
+      - kind: shell
+        desc: hide a deployment somewhere unexpected
+        run: |
+          kubectl create ns backoffice-legacy
+          kubectl -n backoffice-legacy create deployment hidden-app --image=registry.k8s.io/pause:3.9
+    verify:
+      - id: namespaces
+        desc: dev, staging and prod all exist
+        points: 20
+        hint: kubectl create ns dev
+        run: |
+          has ns dev && has ns staging && has ns prod
+      - id: found
+        desc: The ConfigMap dev/found points at the right namespace
+        points: 30
+        hint: "kubectl get deploy -A | grep hidden-app"
+        run: |
+          got=$(jp cm found '{.data.namespace}' -n dev | tr -d ' ')
+          eq "$got" "backoffice-legacy"
+      - id: context
+        desc: Your current context defaults to the dev namespace
+        points: 25
+        hint: "kubectl config set-context --current --namespace=dev"
+        run: |
+          ctx=$(kubectl config current-context)
+          got=$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.namespace}")
+          eq "$got" "dev"
+      - id: label
+        desc: The prod namespace carries tier=critical
+        points: 25
+        hint: "kubectl label ns prod tier=critical"
+        run: |
+          eq "$(jp ns prod '{.metadata.labels.tier}')" "critical"
+    hints:
+      - title: Searching every namespace
+        cost: 6
+        text: |
+          `-A` (or `--all-namespaces`) makes any `kubectl get` span the
+          whole cluster:
+
+          ```
+          kubectl get deploy -A | grep hidden-app
+          ```
+      - title: Changing your default namespace
+        cost: 8
+        text: |
+          ```
+          kubectl config set-context --current --namespace=dev
+          ```
+          In the lab shell there is an alias for this: `kn dev`.
+    solution: |
+      ```bash
+      kubectl create ns dev
+      kubectl create ns staging
+      kubectl create ns prod
+
+      kubectl get deploy -A | grep hidden-app        # -> backoffice-legacy
+      kubectl -n dev create configmap found --from-literal=namespace=backoffice-legacy
+
+      kubectl config set-context --current --namespace=dev
+      kubectl label ns prod tier=critical
+      ```
+    solve_script: |
+      kubectl create ns dev; kubectl create ns staging; kubectl create ns prod
+      kubectl -n dev create configmap found --from-literal=namespace=backoffice-legacy
+      kubectl config set-context --current --namespace=dev
+      kubectl label ns prod tier=critical
+
+  - id: core-imperative-yaml
+    title: Generate manifests instead of typing them
+    difficulty: easy
+    exams: [CKA, CKAD]
+    concepts: [kubectl, manifests, dry-run, imperative commands]
+    par_minutes: 8
+    estimated_minutes: 12
+    blurb: The exam-speed skill - let kubectl write the YAML, then edit what you need.
+    scenario: |
+      Nobody types Kubernetes YAML from memory under exam time pressure.
+      The trick is `--dry-run=client -o yaml`: kubectl generates a valid
+      manifest, you edit the two or three fields you actually care about,
+      and you apply it.
+
+      In your lab shell `$do` is already set to `--dry-run=client -o yaml`,
+      so `kubectl run x --image=nginx $do` just works.
+
+      Produce three objects in the `build` namespace. Each one has a small
+      twist that the generator does not give you for free, so you have to
+      edit the generated YAML rather than just running the command.
+    docs:
+      - https://kubernetes.io/docs/reference/kubectl/conventions/
+      - https://kubernetes.io/docs/reference/generated/kubectl/kubectl-commands
+    tasks:
+      - text: "Create namespace `build`."
+      - text: "A Pod `probe` running image `busybox:1.36` whose command is `sleep 3600`, with the label `role=probe`."
+      - text: "A Deployment `api` with 3 replicas of `nginx:1.27-alpine`, where the container port 80 is declared in the pod spec."
+      - text: "A CronJob `nightly` on schedule `0 2 * * *` running `busybox:1.36` with the command `echo backup done`."
+    setup:
+      - kind: shell
+        desc: prepare the build namespace
+        run: kubectl create ns build
+    verify:
+      - id: pod
+        desc: Pod build/probe runs busybox with a sleep command and the right label
+        points: 25
+        hint: "kubectl -n build run probe --image=busybox:1.36 $do -- sleep 3600"
+        run: |
+          eq "$(jp pod probe '{.spec.containers[0].image}' -n build)" "busybox:1.36" || exit 1
+          eq "$(jp pod probe '{.metadata.labels.role}' -n build)" "probe" || exit 1
+          jp pod probe '{.spec.containers[0].command}' -n build | grep -q 'sleep'
+          jp pod probe '{.spec.containers[0].args} {.spec.containers[0].command}' -n build | grep -q '3600'
+      - id: deploy-replicas
+        desc: Deployment build/api has 3 replicas of nginx:1.27-alpine
+        points: 25
+        hint: "kubectl -n build create deployment api --image=nginx:1.27-alpine --replicas=3"
+        run: |
+          eq "$(jp deploy api '{.spec.replicas}' -n build)" "3" || exit 1
+          eq "$(jp deploy api '{.spec.template.spec.containers[0].image}' -n build)" "nginx:1.27-alpine"
+      - id: deploy-port
+        desc: The api pod template declares container port 80
+        points: 20
+        hint: "add ports: [{containerPort: 80}] to the container, or use --port=80"
+        run: |
+          eq "$(jp deploy api '{.spec.template.spec.containers[0].ports[0].containerPort}' -n build)" "80"
+      - id: deploy-ready
+        desc: The api Deployment actually rolls out
+        points: 15
+        hint: "kubectl -n build rollout status deploy/api"
+        run: |
+          rollout build deploy/api 120s
+      - id: cronjob
+        desc: CronJob build/nightly is scheduled at 0 2 * * *
+        points: 15
+        hint: 'kubectl -n build create cronjob nightly --image=busybox:1.36 --schedule="0 2 * * *" -- echo backup done'
+        run: |
+          eq "$(jp cronjob nightly '{.spec.schedule}' -n build)" "0 2 * * *" || exit 1
+          jp cronjob nightly '{.spec.jobTemplate.spec.template.spec.containers[0].image}' -n build | grep -q busybox
+    hints:
+      - title: The generator flags
+        cost: 8
+        text: |
+          - Pod: `kubectl run NAME --image=IMG -l role=probe $do -- sleep 3600`
+          - Deployment: `kubectl create deployment NAME --image=IMG --replicas=3 --port=80 $do`
+          - CronJob: `kubectl create cronjob NAME --image=IMG --schedule="0 2 * * *" $do -- echo backup done`
+
+          Everything after `--` becomes the container command/args.
+      - title: Editing before you apply
+        cost: 10
+        text: |
+          Send the generated YAML to a file, edit it, then apply:
+
+          ```
+          kubectl -n build create deployment api --image=nginx:1.27-alpine --replicas=3 $do > api.yaml
+          vi api.yaml     # add ports: under the container
+          kubectl apply -f api.yaml
+          ```
+
+          Your files live in the attempt workdir, and anything you apply is
+          captured into your recorded solution.
+    solution: |
+      ```bash
+      kubectl create ns build
+
+      kubectl -n build run probe --image=busybox:1.36 -l role=probe -- sleep 3600
+
+      kubectl -n build create deployment api --image=nginx:1.27-alpine --replicas=3 \
+        --port=80
+
+      kubectl -n build create cronjob nightly --image=busybox:1.36 \
+        --schedule="0 2 * * *" -- echo backup done
+      ```
+
+      `--port=80` on `create deployment` is what puts `containerPort: 80`
+      into the pod template.
+    solve_script: |
+      kubectl -n build run probe --image=busybox:1.36 -l role=probe -- sleep 3600
+      kubectl -n build create deployment api --image=nginx:1.27-alpine --replicas=3 --port=80
+      kubectl -n build create cronjob nightly --image=busybox:1.36 --schedule="0 2 * * *" -- echo backup done
+      kubectl -n build rollout status deploy/api --timeout=120s
+
+  - id: core-labels-selectors
+    title: Labels, selectors and the queries that depend on them
+    difficulty: easy
+    exams: [KCNA, CKA, CKAD]
+    concepts: [labels, selectors, annotations]
+    par_minutes: 9
+    estimated_minutes: 12
+    blurb: Labels are how everything in Kubernetes finds everything else. Get fluent.
+    scenario: |
+      A previous engineer created six pods in the `fleet` namespace with
+      inconsistent labelling. Services, Deployments, NetworkPolicies and
+      `kubectl get -l` all rely on labels, so this mess breaks everything
+      downstream.
+
+      Tidy it up, then prove you can query with set-based selectors.
+    docs:
+      - https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+    tasks:
+      - text: "Every pod in `fleet` must end up with the label `app=fleet`."
+      - text: "Pods named `web-*` must have `tier=frontend`; pods named `db-*` must have `tier=backend`."
+      - text: "Remove the misleading label `env` from every pod in `fleet`."
+      - text: "Annotate the pod `web-1` with `owner=platform-team` (an annotation, not a label)."
+    setup:
+      - kind: shell
+        desc: create six inconsistently labelled pods
+        run: |
+          kubectl create ns fleet
+          for n in web-1 web-2 web-3; do
+            kubectl -n fleet run $n --image=registry.k8s.io/pause:3.9 -l env=old
+          done
+          for n in db-1 db-2 db-3; do
+            kubectl -n fleet run $n --image=registry.k8s.io/pause:3.9 -l env=old,tier=frontend
+          done
+    verify:
+      - id: app-label
+        desc: All six pods carry app=fleet
+        points: 25
+        hint: "kubectl -n fleet label pods --all app=fleet"
+        run: |
+          total=$(kubectl -n fleet get pods --no-headers | wc -l | tr -d ' ')
+          got=$(kubectl -n fleet get pods -l app=fleet --no-headers | wc -l | tr -d ' ')
+          eq "$total" "6" && eq "$got" "6"
+      - id: tiers
+        desc: web pods are tier=frontend and db pods are tier=backend
+        points: 30
+        hint: "kubectl -n fleet label pod db-1 tier=backend --overwrite"
+        run: |
+          f=$(kubectl -n fleet get pods -l tier=frontend -o name | sort | tr '\n' ' ')
+          b=$(kubectl -n fleet get pods -l tier=backend -o name | sort | tr '\n' ' ')
+          eq "$f" "pod/web-1 pod/web-2 pod/web-3 " && eq "$b" "pod/db-1 pod/db-2 pod/db-3 "
+      - id: env-gone
+        desc: No pod in fleet has an env label any more
+        points: 25
+        hint: "kubectl -n fleet label pods --all env-"
+        run: |
+          n=$(kubectl -n fleet get pods -l env --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          eq "$n" "0"
+      - id: annotation
+        desc: Pod web-1 is annotated owner=platform-team
+        points: 20
+        hint: "kubectl -n fleet annotate pod web-1 owner=platform-team"
+        run: |
+          eq "$(jp pod web-1 '{.metadata.annotations.owner}' -n fleet)" "platform-team"
+    hints:
+      - title: Bulk labelling
+        cost: 6
+        text: |
+          `--all` applies to every object of that kind in the namespace, and
+          a trailing `-` removes a label:
+
+          ```
+          kubectl -n fleet label pods --all app=fleet
+          kubectl -n fleet label pods --all env-
+          ```
+      - title: Overwriting an existing label
+        cost: 8
+        text: |
+          The db pods already have `tier=frontend`, so plain `label` refuses
+          to change it. Add `--overwrite`:
+
+          ```
+          kubectl -n fleet label pod db-1 db-2 db-3 tier=backend --overwrite
+          ```
+    solution: |
+      ```bash
+      kubectl -n fleet label pods --all app=fleet
+      kubectl -n fleet label pod web-1 web-2 web-3 tier=frontend --overwrite
+      kubectl -n fleet label pod db-1 db-2 db-3 tier=backend --overwrite
+      kubectl -n fleet label pods --all env-
+      kubectl -n fleet annotate pod web-1 owner=platform-team
+      ```
+    solve_script: |
+      kubectl -n fleet label pods --all app=fleet
+      kubectl -n fleet label pod web-1 web-2 web-3 tier=frontend --overwrite
+      kubectl -n fleet label pod db-1 db-2 db-3 tier=backend --overwrite
+      kubectl -n fleet label pods --all env-
+      kubectl -n fleet annotate pod web-1 owner=platform-team
+
+  - id: core-api-discovery
+    title: Discover the API without leaving the terminal
+    difficulty: easy
+    exams: [KCNA, CKA]
+    concepts: [api resources, kubectl explain, api groups]
+    par_minutes: 8
+    estimated_minutes: 11
+    blurb: kubectl explain and api-resources answer most "what is the field called" questions.
+    scenario: |
+      In the exam you get kubernetes.io and nothing else - but a lot of the
+      time you do not even need it. `kubectl api-resources` and
+      `kubectl explain` are a complete, always-current reference for the
+      cluster in front of you.
+
+      Answer four questions using only kubectl, and record them in the
+      ConfigMap `api-answers` in namespace `klab`.
+    docs:
+      - https://kubernetes.io/docs/reference/kubectl/generated/kubectl_explain/
+    tasks:
+      - text: "Create namespace `klab` if it does not exist."
+      - text: "Key `shortname` = the short name kubectl accepts for `persistentvolumeclaims`."
+      - text: "Key `group` = the API group that `Deployment` belongs to."
+      - text: "Key `scope` = `true` or `false`, whether `ClusterRole` is namespaced."
+      - text: "Key `field` = the field under `spec` of a Pod that sets how long the pod gets to shut down gracefully."
+    verify:
+      - id: shortname
+        desc: The PVC short name is recorded correctly
+        points: 25
+        hint: "kubectl api-resources | grep persistentvolumeclaims"
+        run: |
+          eq "$(jp cm api-answers '{.data.shortname}' -n klab | tr -d ' ')" "pvc"
+      - id: group
+        desc: The Deployment API group is recorded correctly
+        points: 25
+        hint: "kubectl api-resources | grep -w deployments  -- look at the APIVERSION column"
+        run: |
+          eq "$(jp cm api-answers '{.data.group}' -n klab | tr -d ' ')" "apps"
+      - id: scope
+        desc: ClusterRole namespaced-ness is recorded correctly
+        points: 25
+        hint: "kubectl api-resources | grep -w clusterroles  -- the NAMESPACED column"
+        run: |
+          eq "$(jp cm api-answers '{.data.scope}' -n klab | tr -d ' ' | tr 'A-Z' 'a-z')" "false"
+      - id: field
+        desc: The graceful shutdown field is recorded correctly
+        points: 25
+        hint: "kubectl explain pod.spec | grep -i grace"
+        run: |
+          eq "$(jp cm api-answers '{.data.field}' -n klab | tr -d ' ')" "terminationGracePeriodSeconds"
+    hints:
+      - title: The two commands
+        cost: 8
+        text: |
+          ```
+          kubectl api-resources            # names, short names, group, namespaced
+          kubectl explain pod.spec         # every field, one level down
+          kubectl explain pod.spec.containers --recursive
+          ```
+      - title: Reading api-resources
+        cost: 10
+        text: |
+          The columns are NAME, SHORTNAMES, APIVERSION, NAMESPACED, KIND.
+          `apps/v1` means group `apps`, version `v1`. A resource with an
+          APIVERSION of just `v1` is in the core (empty) group.
+    solution: |
+      ```bash
+      kubectl create ns klab 2>/dev/null
+
+      kubectl api-resources | grep persistentvolumeclaims   # pvc
+      kubectl api-resources | grep -w deployments           # apps/v1
+      kubectl api-resources | grep -w clusterroles          # NAMESPACED=false
+      kubectl explain pod.spec | grep -i grace              # terminationGracePeriodSeconds
+
+      kubectl -n klab create configmap api-answers \
+        --from-literal=shortname=pvc \
+        --from-literal=group=apps \
+        --from-literal=scope=false \
+        --from-literal=field=terminationGracePeriodSeconds
+      ```
+    solve_script: |
+      kubectl create ns klab 2>/dev/null || true
+      kubectl -n klab create configmap api-answers \
+        --from-literal=shortname=pvc \
+        --from-literal=group=apps \
+        --from-literal=scope=false \
+        --from-literal=field=terminationGracePeriodSeconds
+
+  - id: core-control-plane-anatomy
+    title: Find and read the control plane's static pods
+    difficulty: medium
+    exams: [KCNA, CKA]
+    concepts: [control plane, static pods, kubelet, etcd, scheduler]
+    par_minutes: 12
+    estimated_minutes: 16
+    blurb: The API server, scheduler, controller-manager and etcd are just pods on disk.
+    scenario: |
+      On a kubeadm cluster the control plane runs as *static pods*: the
+      kubelet on the control plane node watches a directory on disk and runs
+      whatever manifests it finds there, with no help from the API server at
+      all. That is the bootstrap trick that lets a cluster start itself.
+
+      Get onto the control plane node and read those manifests. In the lab
+      shell, `knode` lists the nodes and `knode <name>` gives you a shell
+      inside one.
+
+      Record what you find in the ConfigMap `cp` in namespace `klab`.
+    docs:
+      - https://kubernetes.io/docs/tasks/configure-pod-container/static-pod/
+      - https://kubernetes.io/docs/concepts/overview/components/
+    tasks:
+      - text: "Create namespace `klab` if needed."
+      - text: "Key `dir` = the absolute path of the directory the kubelet reads static pod manifests from."
+      - text: "Key `etcdport` = the client port etcd is listening on (from the etcd manifest)."
+      - text: "Key `servicecidr` = the value of the API server's `--service-cluster-ip-range` flag."
+      - text: "Key `owner` = the kind of the ownerReference on the `kube-apiserver-*` pod (this is what marks it as a static pod mirror)."
+    setup: []
+    verify:
+      - id: dir
+        desc: The static pod directory is recorded correctly
+        points: 25
+        hint: "knode kubestronaut-control-plane cat /var/lib/kubelet/config.yaml | grep -i staticPodPath"
+        run: |
+          got=$(jp cm cp '{.data.dir}' -n klab | tr -d ' ' | sed 's:/*$::')
+          eq "$got" "/etc/kubernetes/manifests"
+      - id: etcdport
+        desc: The etcd client port is recorded correctly
+        points: 25
+        hint: "knode <node> grep listen-client /etc/kubernetes/manifests/etcd.yaml"
+        run: |
+          eq "$(jp cm cp '{.data.etcdport}' -n klab | tr -d ' ')" "2379"
+      - id: servicecidr
+        desc: The service CIDR matches the API server flag
+        points: 25
+        hint: "kubectl -n kube-system get pod -l component=kube-apiserver -o yaml | grep service-cluster-ip-range"
+        run: |
+          want=$(kubectl -n kube-system get pod -l component=kube-apiserver \
+            -o jsonpath='{.items[0].spec.containers[0].command}' \
+            | tr ',' '\n' | grep -o 'service-cluster-ip-range=[^"]*' | cut -d= -f2)
+          got=$(jp cm cp '{.data.servicecidr}' -n klab | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: owner
+        desc: The ownerReference kind of the API server pod is recorded
+        points: 25
+        hint: "kubectl -n kube-system get pod <apiserver-pod> -o jsonpath='{.metadata.ownerReferences[0].kind}'"
+        run: |
+          eq "$(jp cm cp '{.data.owner}' -n klab | tr -d ' ')" "Node"
+    hints:
+      - title: Getting onto the node
+        cost: 8
+        text: |
+          ```
+          knode                                   # lists the kind node containers
+          knode kubestronaut-control-plane        # interactive shell on it
+          knode kubestronaut-control-plane ls /etc/kubernetes/manifests
+          ```
+          A kind "node" is a container, so `docker exec` is how you get in.
+      - title: Reading the manifests
+        cost: 10
+        text: |
+          Inside the node:
+
+          ```
+          cat /var/lib/kubelet/config.yaml | grep -i staticpodpath
+          grep listen-client-urls /etc/kubernetes/manifests/etcd.yaml
+          grep service-cluster-ip-range /etc/kubernetes/manifests/kube-apiserver.yaml
+          ```
+      - title: Why the owner is a Node
+        cost: 12
+        text: |
+          The kubelet creates a read-only *mirror pod* in the API server for
+          each static pod, and sets its ownerReference to the Node object.
+          That is exactly why you cannot delete a static pod with
+          `kubectl delete pod` - it just comes back.
+    solution: |
+      ```bash
+      kubectl create ns klab 2>/dev/null
+      NODE=kubestronaut-control-plane
+
+      docker exec $NODE grep -i staticPodPath /var/lib/kubelet/config.yaml
+      docker exec $NODE grep listen-client-urls /etc/kubernetes/manifests/etcd.yaml
+      docker exec $NODE grep service-cluster-ip-range /etc/kubernetes/manifests/kube-apiserver.yaml
+      kubectl -n kube-system get pod -l component=kube-apiserver \
+        -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}'
+
+      CIDR=$(kubectl -n kube-system get pod -l component=kube-apiserver \
+        -o jsonpath='{.items[0].spec.containers[0].command}' \
+        | tr ',' '\n' | grep -o 'service-cluster-ip-range=[^"]*' | cut -d= -f2)
+
+      kubectl -n klab create configmap cp \
+        --from-literal=dir=/etc/kubernetes/manifests \
+        --from-literal=etcdport=2379 \
+        --from-literal=servicecidr=$CIDR \
+        --from-literal=owner=Node
+      ```
+    solve_script: |
+      kubectl create ns klab 2>/dev/null || true
+      CIDR=$(kubectl -n kube-system get pod -l component=kube-apiserver \
+        -o jsonpath='{.items[0].spec.containers[0].command}' \
+        | tr ',' '\n' | grep -o 'service-cluster-ip-range=[^"]*' | cut -d= -f2)
+      kubectl -n klab create configmap cp \
+        --from-literal=dir=/etc/kubernetes/manifests \
+        --from-literal=etcdport=2379 \
+        --from-literal=servicecidr=$CIDR \
+        --from-literal=owner=Node
+
+  - id: core-object-anatomy
+    title: Anatomy of an object - apiVersion, kind, metadata, spec, status
+    difficulty: easy
+    exams: [KCNA, CKAD]
+    concepts: [manifests, api objects, desired state, controllers]
+    par_minutes: 8
+    estimated_minutes: 11
+    blurb: Write a manifest by hand and watch a controller reconcile spec into status.
+    scenario: |
+      Every Kubernetes object has the same shape: `apiVersion`, `kind`,
+      `metadata`, a `spec` you write, and a `status` the system writes back.
+      Controllers exist to make status match spec, forever.
+
+      Write a Deployment manifest by hand (no generators for this one) and
+      then observe the reconciliation loop doing its job.
+    docs:
+      - https://kubernetes.io/docs/concepts/overview/working-with-objects/
+    tasks:
+      - text: "Create namespace `anatomy`."
+      - text: "Hand-write a Deployment `shop` in `anatomy`: 2 replicas, image `registry.k8s.io/pause:3.9`, labels `app=shop` on both the selector and the pod template."
+      - text: "Add the annotation `written-by=hand` to the Deployment object itself (not the pods)."
+      - text: "Scale it to 4 replicas and confirm the Deployment's status reports 4 ready."
+    setup:
+      - kind: shell
+        desc: create the anatomy namespace
+        run: kubectl create ns anatomy
+    verify:
+      - id: exists
+        desc: Deployment anatomy/shop exists with a matching selector
+        points: 25
+        hint: "spec.selector.matchLabels must equal the labels on spec.template.metadata"
+        run: |
+          eq "$(jp deploy shop '{.spec.selector.matchLabels.app}' -n anatomy)" "shop" || exit 1
+          eq "$(jp deploy shop '{.spec.template.metadata.labels.app}' -n anatomy)" "shop"
+      - id: annotation
+        desc: The Deployment carries the written-by=hand annotation
+        points: 20
+        hint: "metadata.annotations on the Deployment, or kubectl annotate deploy/shop written-by=hand"
+        run: |
+          eq "$(jp deploy shop '{.metadata.annotations.written-by}' -n anatomy)" "hand"
+      - id: scaled
+        desc: spec.replicas is 4
+        points: 25
+        hint: "kubectl -n anatomy scale deploy/shop --replicas=4"
+        run: |
+          eq "$(jp deploy shop '{.spec.replicas}' -n anatomy)" "4"
+      - id: status
+        desc: status.readyReplicas has caught up to 4
+        points: 30
+        hint: "give the controller a moment, then kubectl -n anatomy get deploy shop"
+        run: |
+          retry bash -c '[ "$(kubectl -n anatomy get deploy shop -o jsonpath="{.status.readyReplicas}")" = "4" ]'
+    hints:
+      - title: The minimum viable Deployment
+        cost: 8
+        text: |
+          ```yaml
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: shop
+            namespace: anatomy
+            annotations:
+              written-by: hand
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: shop
+            template:
+              metadata:
+                labels:
+                  app: shop
+              spec:
+                containers:
+                  - name: shop
+                    image: registry.k8s.io/pause:3.9
+          ```
+      - title: Selector and template labels must agree
+        cost: 10
+        text: |
+          If `spec.selector.matchLabels` does not match
+          `spec.template.metadata.labels` the API server rejects the object
+          outright. The selector is also immutable after creation - you have
+          to delete and recreate to change it.
+    solution: |
+      ```bash
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: shop
+        namespace: anatomy
+        annotations:
+          written-by: hand
+      spec:
+        replicas: 2
+        selector:
+          matchLabels:
+            app: shop
+        template:
+          metadata:
+            labels:
+              app: shop
+          spec:
+            containers:
+              - name: shop
+                image: registry.k8s.io/pause:3.9
+      YAML
+
+      kubectl -n anatomy scale deploy/shop --replicas=4
+      kubectl -n anatomy rollout status deploy/shop
+      ```
+    solve_script: |
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: shop
+        namespace: anatomy
+        annotations:
+          written-by: hand
+      spec:
+        replicas: 4
+        selector:
+          matchLabels:
+            app: shop
+        template:
+          metadata:
+            labels:
+              app: shop
+          spec:
+            containers:
+              - name: shop
+                image: registry.k8s.io/pause:3.9
+      YAML
+      kubectl -n anatomy rollout status deploy/shop --timeout=120s

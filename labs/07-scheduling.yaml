@@ -1,0 +1,887 @@
+category: Scheduling & Node Management
+labs:
+
+  - id: sched-nodeselector-affinity
+    title: nodeSelector, node affinity and the difference between them
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [nodeSelector, node affinity, scheduling, node labels]
+    par_minutes: 14
+    estimated_minutes: 18
+    cluster:
+      nodes: 3
+    blurb: Hard placement, soft preference, and why affinity replaced nodeSelector.
+    scenario: |
+      Three nodes, and workloads with different placement needs:
+
+      - `gpu-job` must only ever run on a node labelled `hardware=gpu` -
+        a hard requirement, no exceptions.
+      - `batch` would *prefer* a node labelled `disk=ssd` but must still
+        schedule if none is available.
+
+      `nodeSelector` can only express the first. Node affinity expresses
+      both, and adds set-based operators (`In`, `NotIn`, `Exists`).
+    docs:
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+    tasks:
+      - text: "Label one worker node `hardware=gpu` and the other worker `disk=ssd`."
+      - text: "Create Pod `gpu-job` in `sched` (`registry.k8s.io/pause:3.9`) using a plain `nodeSelector` of `hardware=gpu`."
+      - text: "Create Pod `batch` in `sched` using `preferredDuringSchedulingIgnoredDuringExecution` node affinity with weight 50 for `disk=ssd`."
+      - text: "Both pods must actually be Running, and `gpu-job` must be on the GPU node."
+    setup:
+      - kind: shell
+        desc: create the sched namespace and clear old labels
+        run: |
+          kubectl create ns sched
+          for n in $(kubectl get nodes -o name); do
+            kubectl label "$n" hardware- disk- 2>/dev/null || true
+          done
+    verify:
+      - id: labels
+        desc: One node is hardware=gpu and another is disk=ssd
+        points: 25
+        hint: "kubectl label node kubestronaut-worker hardware=gpu"
+        run: |
+          g=$(kubectl get nodes -l hardware=gpu --no-headers | wc -l | tr -d ' ')
+          s=$(kubectl get nodes -l disk=ssd --no-headers | wc -l | tr -d ' ')
+          [ "$g" -ge 1 ] && [ "$s" -ge 1 ]
+      - id: nodeselector
+        desc: gpu-job uses a nodeSelector of hardware=gpu
+        points: 25
+        hint: "spec.nodeSelector: {hardware: gpu}"
+        run: |
+          eq "$(jp pod gpu-job '{.spec.nodeSelector.hardware}' -n sched)" "gpu"
+      - id: placed
+        desc: gpu-job is Running on a node that really has the gpu label
+        points: 25
+        hint: "kubectl -n sched get pod gpu-job -o wide"
+        run: |
+          RETRY=25 retry bash -c '[ "$(kubectl -n sched get pod gpu-job -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          node=$(jp pod gpu-job '{.spec.nodeName}' -n sched)
+          [ -n "$node" ] || exit 1
+          eq "$(jp node "$node" '{.metadata.labels.hardware}')" "gpu"
+      - id: affinity
+        desc: batch uses preferred node affinity with weight 50 for disk=ssd
+        points: 25
+        hint: "affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution"
+        run: |
+          a='.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0]'
+          eq "$(jp pod batch "{$a.weight}" -n sched)" "50" || exit 1
+          eq "$(jp pod batch "{$a.preference.matchExpressions[0].key}" -n sched)" "disk" || exit 1
+          jp pod batch "{$a.preference.matchExpressions[0].values[*]}" -n sched | grep -q ssd || exit 1
+          RETRY=25 retry bash -c '[ "$(kubectl -n sched get pod batch -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: Labelling nodes
+        cost: 8
+        text: |
+          ```
+          kubectl get nodes
+          kubectl label node kubestronaut-worker  hardware=gpu
+          kubectl label node kubestronaut-worker2 disk=ssd
+          ```
+      - title: The affinity shape
+        cost: 12
+        text: |
+          ```yaml
+          spec:
+            affinity:
+              nodeAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 50
+                    preference:
+                      matchExpressions:
+                        - key: disk
+                          operator: In
+                          values: ["ssd"]
+          ```
+          Note `preference` (singular) for preferred rules, but
+          `nodeSelectorTerms` for required ones - the shapes differ.
+      - title: Required versus preferred
+        cost: 10
+        text: |
+          - `requiredDuringScheduling...` = must match or stay Pending
+          - `preferredDuringScheduling...` = scoring only, weight 1-100
+
+          `IgnoredDuringExecution` in both names means: if the node's labels
+          change later, a running pod is not evicted.
+    solution: |
+      ```bash
+      W1=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+      W2=$(kubectl get nodes -o name | grep worker | tail -1 | cut -d/ -f2)
+      kubectl label node "$W1" hardware=gpu --overwrite
+      kubectl label node "$W2" disk=ssd --overwrite
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: gpu-job, namespace: sched}
+      spec:
+        nodeSelector:
+          hardware: gpu
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: batch, namespace: sched}
+      spec:
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 50
+                preference:
+                  matchExpressions:
+                    - key: disk
+                      operator: In
+                      values: ["ssd"]
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      YAML
+      ```
+    solve_script: |
+      W1=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+      W2=$(kubectl get nodes -o name | grep worker | tail -1 | cut -d/ -f2)
+      kubectl label node "$W1" hardware=gpu --overwrite
+      kubectl label node "$W2" disk=ssd --overwrite
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: gpu-job, namespace: sched}
+      spec:
+        nodeSelector: {hardware: gpu}
+        containers: [{name: c, image: registry.k8s.io/pause:3.9}]
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: batch, namespace: sched}
+      spec:
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 50
+                preference:
+                  matchExpressions:
+                    - key: disk
+                      operator: In
+                      values: ["ssd"]
+        containers: [{name: c, image: registry.k8s.io/pause:3.9}]
+      YAML
+      kubectl -n sched wait --for=condition=Ready pod/gpu-job pod/batch --timeout=180s
+
+  - id: sched-taints-tolerations
+    title: Taints and tolerations - keeping pods off a node
+    difficulty: medium
+    exams: [CKA]
+    concepts: [taints, tolerations, NoSchedule, NoExecute, node maintenance]
+    par_minutes: 14
+    estimated_minutes: 18
+    cluster:
+      nodes: 3
+    blurb: Taints repel; tolerations grant an exception. The opposite of affinity.
+    scenario: |
+      Affinity is a pod saying "I want that node". A taint is a node saying
+      "go away unless you have permission".
+
+      A worker is being reserved for a latency-sensitive workload. Taint it,
+      watch existing pods get evicted, and give only the intended workload a
+      toleration.
+
+      The three effects:
+
+      - `NoSchedule` - no new pods without a toleration
+      - `PreferNoSchedule` - soft version
+      - `NoExecute` - also evicts pods already running there
+    docs:
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
+    tasks:
+      - text: "Taint one worker node with `dedicated=latency:NoSchedule`."
+      - text: "Create Deployment `general` in `taints` (2 replicas, `registry.k8s.io/pause:3.9`) with no toleration - it must avoid the tainted node."
+      - text: "Create Deployment `latency-app` in `taints` (1 replica) with a toleration for that exact taint AND a nodeSelector or affinity that pins it there."
+      - text: "Everything must end up Running - no Pending pods."
+    setup:
+      - kind: shell
+        desc: create the taints namespace and clear existing taints
+        run: |
+          kubectl create ns taints
+          for n in $(kubectl get nodes -o name); do
+            kubectl taint "$n" dedicated- 2>/dev/null || true
+            kubectl label "$n" reserved- 2>/dev/null || true
+          done
+    verify:
+      - id: taint
+        desc: A worker node carries dedicated=latency:NoSchedule
+        points: 25
+        hint: "kubectl taint node <worker> dedicated=latency:NoSchedule"
+        run: |
+          kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.taints[*].key}{"="}{.spec.taints[*].value}{":"}{.spec.taints[*].effect}{"\n"}{end}' \
+            | grep -q 'dedicated=latency:NoSchedule'
+      - id: general-avoids
+        desc: No general pod is scheduled onto the tainted node
+        points: 25
+        hint: "a pod without a matching toleration simply will not be placed there"
+        run: |
+          rollout taints deploy/general 180s || exit 1
+          tainted=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.taints[*].key}{"\n"}{end}' \
+            | grep dedicated | awk '{print $1}' | head -1)
+          [ -n "$tainted" ] || exit 1
+          n=$(kubectl -n taints get pods -l app=general -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' \
+            | grep -c "^$tainted$" || true)
+          [ "${n:-0}" -eq 0 ]
+      - id: toleration
+        desc: latency-app tolerates the dedicated taint
+        points: 25
+        hint: "tolerations: [{key: dedicated, operator: Equal, value: latency, effect: NoSchedule}]"
+        run: |
+          t='.spec.template.spec.tolerations[0]'
+          eq "$(jp deploy latency-app "{$t.key}" -n taints)" "dedicated" || exit 1
+          eq "$(jp deploy latency-app "{$t.effect}" -n taints)" "NoSchedule"
+      - id: placed
+        desc: latency-app is actually running on the tainted node
+        points: 25
+        hint: "a toleration only permits placement -- you still need a selector to require it"
+        run: |
+          rollout taints deploy/latency-app 180s || exit 1
+          tainted=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.taints[*].key}{"\n"}{end}' \
+            | grep dedicated | awk '{print $1}' | head -1)
+          n=$(kubectl -n taints get pods -l app=latency-app -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' \
+            | grep -c "^$tainted$" || true)
+          [ "${n:-0}" -ge 1 ]
+    hints:
+      - title: Applying and removing a taint
+        cost: 8
+        text: |
+          ```
+          kubectl taint node kubestronaut-worker dedicated=latency:NoSchedule
+          kubectl taint node kubestronaut-worker dedicated-        # remove
+          kubectl describe node kubestronaut-worker | grep -i taint
+          ```
+      - title: A toleration is permission, not attraction
+        cost: 12
+        text: |
+          This is the point people miss. Tolerating a taint lets the pod be
+          scheduled there, but the scheduler may still choose another node.
+          To *pin* it, add a label to the node and a nodeSelector to the pod:
+
+          ```
+          kubectl label node kubestronaut-worker reserved=latency
+          ```
+          ```yaml
+          nodeSelector: {reserved: latency}
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: latency
+              effect: NoSchedule
+          ```
+      - title: Patching a Deployment
+        cost: 10
+        text: |
+          ```
+          kubectl -n taints patch deploy latency-app -p '{"spec":{"template":{"spec":{
+            "tolerations":[{"key":"dedicated","operator":"Equal","value":"latency","effect":"NoSchedule"}],
+            "nodeSelector":{"reserved":"latency"}}}}}'
+          ```
+    solution: |
+      ```bash
+      W=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+      kubectl taint node "$W" dedicated=latency:NoSchedule
+      kubectl label node "$W" reserved=latency --overwrite
+
+      kubectl -n taints create deployment general --image=registry.k8s.io/pause:3.9 --replicas=2
+
+      kubectl -n taints create deployment latency-app --image=registry.k8s.io/pause:3.9 --replicas=1
+      kubectl -n taints patch deploy latency-app -p '{"spec":{"template":{"spec":{
+        "tolerations":[{"key":"dedicated","operator":"Equal","value":"latency","effect":"NoSchedule"}],
+        "nodeSelector":{"reserved":"latency"}}}}}'
+
+      kubectl -n taints get pods -o wide
+      ```
+    solve_script: |
+      W=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+      kubectl taint node "$W" dedicated=latency:NoSchedule --overwrite
+      kubectl label node "$W" reserved=latency --overwrite
+      kubectl -n taints create deployment general --image=registry.k8s.io/pause:3.9 --replicas=2
+      kubectl -n taints create deployment latency-app --image=registry.k8s.io/pause:3.9 --replicas=1
+      kubectl -n taints patch deploy latency-app -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"dedicated","operator":"Equal","value":"latency","effect":"NoSchedule"}],"nodeSelector":{"reserved":"latency"}}}}}'
+      kubectl -n taints rollout status deploy/general --timeout=240s
+      kubectl -n taints rollout status deploy/latency-app --timeout=240s
+
+  - id: sched-pod-affinity-spread
+    title: Pod anti-affinity and topology spread constraints
+    difficulty: hard
+    exams: [CKA, CKAD]
+    concepts: [pod affinity, anti-affinity, topology spread, high availability]
+    par_minutes: 16
+    estimated_minutes: 21
+    cluster:
+      nodes: 3
+    blurb: Stop all your replicas landing on one node and dying together.
+    scenario: |
+      A Deployment with three replicas is happy to put all three on one
+      node. When that node reboots, the service is gone.
+
+      Two ways to fix it:
+
+      - **pod anti-affinity**: "do not schedule me next to a pod with these
+        labels, in this topology domain"
+      - **topologySpreadConstraints**: "keep the count per domain within
+        `maxSkew` of each other" - newer, more expressive, and what you
+        should reach for first
+
+      Apply one of each and prove replicas really spread out.
+    docs:
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#inter-pod-affinity-and-anti-affinity
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/
+    tasks:
+      - text: "Give Deployment `ha/critical` a required pod anti-affinity on `app=critical` with topologyKey `kubernetes.io/hostname`."
+      - text: "Give Deployment `ha/spread` a topologySpreadConstraint: maxSkew 1, topologyKey `kubernetes.io/hostname`, whenUnsatisfiable `DoNotSchedule`, matching `app=spread`."
+      - text: "Both Deployments must be fully rolled out."
+      - text: "The two `critical` replicas must end up on different nodes."
+    setup:
+      - kind: shell
+        desc: deploy two workloads with no spreading rules
+        run: |
+          kubectl create ns ha
+          kubectl -n ha create deployment critical --image=registry.k8s.io/pause:3.9 --replicas=2
+          kubectl -n ha create deployment spread --image=registry.k8s.io/pause:3.9 --replicas=3
+          kubectl -n ha rollout status deploy/critical --timeout=180s
+          kubectl -n ha rollout status deploy/spread --timeout=180s
+    verify:
+      - id: antiaffinity
+        desc: critical has required pod anti-affinity on hostname
+        points: 30
+        hint: "affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution"
+        run: |
+          a='.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0]'
+          eq "$(jp deploy critical "{$a.topologyKey}" -n ha)" "kubernetes.io/hostname" || exit 1
+          jp deploy critical "{$a.labelSelector.matchLabels.app}" -n ha | grep -q critical
+      - id: spread-constraint
+        desc: spread has a topologySpreadConstraint with maxSkew 1 and DoNotSchedule
+        points: 30
+        hint: "topologySpreadConstraints is a list on spec.template.spec"
+        run: |
+          t='.spec.template.spec.topologySpreadConstraints[0]'
+          eq "$(jp deploy spread "{$t.maxSkew}" -n ha)" "1" || exit 1
+          eq "$(jp deploy spread "{$t.topologyKey}" -n ha)" "kubernetes.io/hostname" || exit 1
+          eq "$(jp deploy spread "{$t.whenUnsatisfiable}" -n ha)" "DoNotSchedule" || exit 1
+          jp deploy spread "{$t.labelSelector.matchLabels.app}" -n ha | grep -q spread
+      - id: rolled
+        desc: Both Deployments are fully rolled out
+        points: 20
+        hint: "if pods stay Pending, your rule cannot be satisfied on this many nodes"
+        run: |
+          rollout ha deploy/critical 240s && rollout ha deploy/spread 240s
+      - id: separated
+        desc: The two critical replicas are on different nodes
+        points: 20
+        hint: "kubectl -n ha get pods -l app=critical -o wide"
+        run: |
+          nodes=$(kubectl -n ha get pods -l app=critical --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u | wc -l | tr -d ' ')
+          [ "${nodes:-0}" -ge 2 ]
+    hints:
+      - title: The anti-affinity block
+        cost: 12
+        text: |
+          ```yaml
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: critical
+                  topologyKey: kubernetes.io/hostname
+          ```
+          `topologyKey` names a node label. `kubernetes.io/hostname` means
+          "one per node"; `topology.kubernetes.io/zone` would mean "one per
+          zone".
+      - title: The spread constraint
+        cost: 12
+        text: |
+          ```yaml
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  app: spread
+          ```
+          `maxSkew: 1` means the busiest and emptiest node may differ by at
+          most one pod.
+      - title: Careful with replica counts
+        cost: 10
+        text: |
+          Required anti-affinity with `kubernetes.io/hostname` caps you at
+          one replica per node. With three nodes (one of them a tainted
+          control plane), asking for three replicas leaves one Pending
+          forever. That is why `critical` only has two.
+    solution: |
+      ```bash
+      kubectl -n ha patch deploy critical -p '{"spec":{"template":{"spec":{"affinity":{
+        "podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{
+          "labelSelector":{"matchLabels":{"app":"critical"}},
+          "topologyKey":"kubernetes.io/hostname"}]}}}}}}'
+
+      kubectl -n ha patch deploy spread -p '{"spec":{"template":{"spec":{
+        "topologySpreadConstraints":[{
+          "maxSkew":1,
+          "topologyKey":"kubernetes.io/hostname",
+          "whenUnsatisfiable":"DoNotSchedule",
+          "labelSelector":{"matchLabels":{"app":"spread"}}}]}}}}'
+
+      kubectl -n ha get pods -o wide
+      ```
+    solve_script: |
+      kubectl -n ha patch deploy critical -p '{"spec":{"template":{"spec":{"affinity":{"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"labelSelector":{"matchLabels":{"app":"critical"}},"topologyKey":"kubernetes.io/hostname"}]}}}}}}'
+      kubectl -n ha patch deploy spread -p '{"spec":{"template":{"spec":{"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"kubernetes.io/hostname","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"spread"}}}]}}}}'
+      kubectl -n ha rollout status deploy/critical --timeout=300s
+      kubectl -n ha rollout status deploy/spread --timeout=300s
+
+  - id: sched-cordon-drain
+    title: Cordon, drain and safely take a node out of service
+    difficulty: medium
+    exams: [CKA]
+    concepts: [cordon, drain, uncordon, maintenance, eviction]
+    par_minutes: 12
+    estimated_minutes: 15
+    cluster:
+      nodes: 3
+    blurb: The standard node maintenance dance, and the flags you always need.
+    scenario: |
+      A worker node needs a kernel patch. The correct sequence is cordon
+      (stop new pods), drain (evict what is there), do the work, uncordon.
+
+      Two flags you will always need on a real cluster:
+
+      - `--ignore-daemonsets` because DaemonSet pods are supposed to stay
+      - `--delete-emptydir-data` because drain refuses to destroy local data
+        without explicit permission
+    docs:
+      - https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/
+    tasks:
+      - text: "Cordon and drain the worker node that is currently running the most pods from namespace `maint`."
+      - text: "The `app` Deployment must recover to 3 ready replicas on the remaining nodes."
+      - text: "Leave the drained node `SchedulingDisabled` (cordoned) - do not uncordon it yet."
+      - text: "Record the drained node's name in a ConfigMap `maintinfo` in `maint` under key `node`."
+    setup:
+      - kind: shell
+        desc: spread an app across the workers
+        run: |
+          kubectl create ns maint
+          for n in $(kubectl get nodes -o name); do kubectl uncordon "$n" 2>/dev/null || true; done
+          kubectl -n maint create deployment app --image=registry.k8s.io/pause:3.9 --replicas=3
+          kubectl -n maint rollout status deploy/app --timeout=180s
+    verify:
+      - id: cordoned
+        desc: Exactly one node is cordoned
+        points: 30
+        hint: "kubectl cordon <node> -- then kubectl get nodes shows SchedulingDisabled"
+        run: |
+          n=$(kubectl get nodes -o jsonpath='{range .items[*]}{.spec.unschedulable}{"\n"}{end}' | grep -c true || true)
+          [ "${n:-0}" -eq 1 ]
+      - id: recorded
+        desc: The ConfigMap names the node that is actually cordoned
+        points: 25
+        hint: "kubectl get nodes | grep SchedulingDisabled"
+        run: |
+          want=$(kubectl get nodes -o jsonpath='{range .items[?(@.spec.unschedulable==true)]}{.metadata.name}{end}')
+          got=$(jp cm maintinfo '{.data.node}' -n maint | tr -d ' ')
+          [ -n "$want" ] && eq "$got" "$want"
+      - id: evacuated
+        desc: No app pod is left running on the cordoned node
+        points: 25
+        hint: "cordon alone does not move anything -- you must drain"
+        run: |
+          node=$(kubectl get nodes -o jsonpath='{range .items[?(@.spec.unschedulable==true)]}{.metadata.name}{end}')
+          [ -n "$node" ] || exit 1
+          n=$(kubectl -n maint get pods -l app=app --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | grep -c "^$node$" || true)
+          [ "${n:-0}" -eq 0 ]
+      - id: recovered
+        desc: The app Deployment is back to 3 ready replicas
+        points: 20
+        hint: "kubectl -n maint rollout status deploy/app"
+        run: |
+          RETRY=40 retry bash -c '[ "$(kubectl -n maint get deploy app -o jsonpath="{.status.readyReplicas}")" = "3" ]'
+    hints:
+      - title: The sequence
+        cost: 8
+        text: |
+          ```
+          kubectl get nodes
+          kubectl -n maint get pods -o wide          # see where things are
+          kubectl drain kubestronaut-worker --ignore-daemonsets --delete-emptydir-data
+          ```
+          `drain` cordons for you, so you rarely need `cordon` separately.
+      - title: When drain refuses
+        cost: 10
+        text: |
+          Common blockers and their flags:
+
+          - DaemonSet pods -> `--ignore-daemonsets`
+          - pods with emptyDir -> `--delete-emptydir-data`
+          - bare pods not managed by a controller -> `--force` (they are
+            deleted, not rescheduled)
+          - a PodDisruptionBudget that cannot be satisfied -> drain waits
+      - title: Recording the node name
+        cost: 6
+        text: |
+          ```
+          NODE=$(kubectl get nodes -o jsonpath='{range .items[?(@.spec.unschedulable==true)]}{.metadata.name}{end}')
+          kubectl -n maint create configmap maintinfo --from-literal=node=$NODE
+          ```
+    solution: |
+      ```bash
+      kubectl -n maint get pods -o wide
+      NODE=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+
+      kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force
+      kubectl get nodes                    # NODE is SchedulingDisabled
+      kubectl -n maint rollout status deploy/app
+
+      kubectl -n maint create configmap maintinfo --from-literal=node=$NODE
+      ```
+      When maintenance is finished: `kubectl uncordon "$NODE"`.
+    solve_script: |
+      NODE=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+      kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force --timeout=240s
+      kubectl -n maint create configmap maintinfo --from-literal=node=$NODE
+      kubectl -n maint rollout status deploy/app --timeout=300s
+
+  - id: sched-priority-preemption
+    title: PriorityClasses and preemption
+    difficulty: hard
+    exams: [CKA]
+    concepts: [priorityclass, preemption, scheduling, eviction]
+    par_minutes: 14
+    estimated_minutes: 18
+    blurb: When the cluster is full, decide who gets evicted to make room.
+    scenario: |
+      When there is not enough room, the scheduler can evict lower-priority
+      pods to fit a higher-priority one. That behaviour is opt-in via
+      PriorityClasses.
+
+      Create a two-tier scheme and prove it works: fill the namespace with
+      low-priority pods that consume the available CPU, then submit a
+      high-priority pod that only fits if something is evicted.
+    docs:
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/
+    tasks:
+      - text: "Create a PriorityClass `low-priority` with value 100 and `preemptionPolicy: Never`."
+      - text: "Create a PriorityClass `high-priority` with value 100000 and a description."
+      - text: "Create a Deployment `filler` in `prio` with 6 replicas requesting 300m CPU each, using `low-priority`."
+      - text: "Create a Pod `urgent` in `prio` requesting 1 CPU, using `high-priority`, and get it Running."
+    setup:
+      - kind: shell
+        desc: create the prio namespace
+        run: kubectl create ns prio
+    verify:
+      - id: classes
+        desc: Both PriorityClasses exist with the right values
+        points: 30
+        hint: "kubectl create priorityclass low-priority --value=100"
+        run: |
+          eq "$(jp priorityclass low-priority '{.value}')" "100" || exit 1
+          eq "$(jp priorityclass high-priority '{.value}')" "100000" || exit 1
+          jp priorityclass high-priority '{.description}' | grep -q .
+      - id: preemption-policy
+        desc: low-priority never preempts anything
+        points: 20
+        hint: "preemptionPolicy: Never means it waits rather than evicting others"
+        run: |
+          eq "$(jp priorityclass low-priority '{.preemptionPolicy}')" "Never"
+      - id: filler
+        desc: The filler Deployment uses low-priority and requests 300m per pod
+        points: 25
+        hint: "spec.template.spec.priorityClassName"
+        run: |
+          eq "$(jp deploy filler '{.spec.template.spec.priorityClassName}' -n prio)" "low-priority" || exit 1
+          eq "$(jp deploy filler '{.spec.template.spec.containers[0].resources.requests.cpu}' -n prio)" "300m" || exit 1
+          eq "$(jp deploy filler '{.spec.replicas}' -n prio)" "6"
+      - id: urgent
+        desc: The urgent pod is high-priority and Running
+        points: 25
+        hint: "if it stays Pending, the scheduler had nothing it was allowed to preempt"
+        run: |
+          eq "$(jp pod urgent '{.spec.priorityClassName}' -n prio)" "high-priority" || exit 1
+          RETRY=40 retry bash -c '[ "$(kubectl -n prio get pod urgent -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: Creating PriorityClasses
+        cost: 8
+        text: |
+          ```
+          kubectl create priorityclass low-priority --value=100 \
+            --description="best effort background work"
+          kubectl create priorityclass high-priority --value=100000 \
+            --description="customer facing, evicts others if needed"
+          ```
+          Then patch the preemption policy:
+          ```
+          kubectl patch priorityclass low-priority -p '{"preemptionPolicy":"Never"}'
+          ```
+      - title: Attaching a class to a pod
+        cost: 8
+        text: |
+          `priorityClassName` is a pod-spec field:
+
+          ```yaml
+          spec:
+            priorityClassName: high-priority
+            containers:
+              - name: c
+                resources:
+                  requests:
+                    cpu: "1"
+          ```
+      - title: Watching preemption happen
+        cost: 10
+        text: |
+          ```
+          kubectl -n prio get events --sort-by=.lastTimestamp | tail -20
+          ```
+          You will see `Preempted` events naming the victim pods, and the
+          Deployment will immediately try to reschedule them.
+    solution: |
+      ```bash
+      kubectl create priorityclass low-priority --value=100 --description="background"
+      kubectl patch priorityclass low-priority -p '{"preemptionPolicy":"Never"}'
+      kubectl create priorityclass high-priority --value=100000 --description="customer facing"
+
+      kubectl -n prio create deployment filler --image=registry.k8s.io/pause:3.9 --replicas=6
+      kubectl -n prio set resources deploy/filler --requests=cpu=300m
+      kubectl -n prio patch deploy filler -p \
+        '{"spec":{"template":{"spec":{"priorityClassName":"low-priority"}}}}'
+
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: urgent, namespace: prio}
+      spec:
+        priorityClassName: high-priority
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {cpu: "1"}
+      YAML
+      ```
+    solve_script: |
+      kubectl create priorityclass low-priority --value=100 --description="background" 2>/dev/null || true
+      kubectl patch priorityclass low-priority -p '{"preemptionPolicy":"Never"}'
+      kubectl create priorityclass high-priority --value=100000 --description="customer facing" 2>/dev/null || true
+      kubectl -n prio create deployment filler --image=registry.k8s.io/pause:3.9 --replicas=6
+      kubectl -n prio set resources deploy/filler --requests=cpu=300m
+      kubectl -n prio patch deploy filler -p '{"spec":{"template":{"spec":{"priorityClassName":"low-priority"}}}}'
+      sleep 15
+      cat <<'YAML' | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: urgent, namespace: prio}
+      spec:
+        priorityClassName: high-priority
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {cpu: "1"}
+      YAML
+      kubectl -n prio wait --for=condition=Ready pod/urgent --timeout=240s
+
+  - id: sched-manual-and-pending
+    title: Diagnose a Pending pod, then schedule one by hand
+    difficulty: medium
+    exams: [CKA, CKAD]
+    concepts: [scheduling, pending pods, nodeName, troubleshooting, events]
+    par_minutes: 13
+    estimated_minutes: 16
+    cluster:
+      nodes: 2
+    blurb: Read the scheduler's own explanation, then bypass it entirely.
+    scenario: |
+      Three pods in the `stuck` namespace are all Pending, each for a
+      different reason. The scheduler always tells you why - in
+      `kubectl describe pod`, under Events.
+
+      Fix two of them. For the third, bypass the scheduler entirely by
+      setting `spec.nodeName` directly - a genuinely useful trick when the
+      scheduler itself is broken, and a CKA favourite.
+    docs:
+      - https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodename
+      - https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/
+    tasks:
+      - text: "`too-big` requests more CPU than any node has. Recreate it with a request of 100m so it schedules."
+      - text: "`bad-selector` targets a node label that does not exist. Recreate it without the nodeSelector."
+      - text: "`no-scheduler` must be placed on a worker node by setting `spec.nodeName` directly - do not remove anything else from it."
+      - text: "All three pods must end up Running."
+    setup:
+      - kind: shell
+        desc: create three pods that cannot be scheduled
+        run: |
+          kubectl create ns stuck
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: too-big, namespace: stuck}
+          spec:
+            containers:
+              - name: c
+                image: registry.k8s.io/pause:3.9
+                resources:
+                  requests: {cpu: "64"}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: bad-selector, namespace: stuck}
+          spec:
+            nodeSelector: {klab-nonexistent: "yes"}
+            containers:
+              - name: c
+                image: registry.k8s.io/pause:3.9
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: no-scheduler, namespace: stuck, labels: {klab: manual}}
+          spec:
+            schedulerName: klab-does-not-exist
+            containers:
+              - name: c
+                image: registry.k8s.io/pause:3.9
+          YAML
+    verify:
+      - id: too-big
+        desc: too-big is Running with a sane CPU request
+        points: 30
+        hint: "pod resources are immutable -- delete and recreate it"
+        run: |
+          RETRY=25 retry bash -c '[ "$(kubectl -n stuck get pod too-big -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          req=$(jp pod too-big '{.spec.containers[0].resources.requests.cpu}' -n stuck)
+          [ "$req" != "64" ]
+      - id: bad-selector
+        desc: bad-selector is Running with no impossible nodeSelector
+        points: 30
+        hint: "nodeSelector is immutable too -- recreate without it"
+        run: |
+          RETRY=25 retry bash -c '[ "$(kubectl -n stuck get pod bad-selector -o jsonpath="{.status.phase}")" = "Running" ]' || exit 1
+          [ -z "$(jp pod bad-selector '{.spec.nodeSelector.klab-nonexistent}' -n stuck)" ]
+      - id: manual
+        desc: no-scheduler is Running because you set nodeName by hand
+        points: 40
+        hint: "recreate it with spec.nodeName set to a real node -- keep schedulerName as it is"
+        run: |
+          node=$(jp pod no-scheduler '{.spec.nodeName}' -n stuck)
+          [ -n "$node" ] || exit 1
+          has node "$node" || exit 1
+          eq "$(jp pod no-scheduler '{.spec.schedulerName}' -n stuck)" "klab-does-not-exist" || exit 1
+          RETRY=25 retry bash -c '[ "$(kubectl -n stuck get pod no-scheduler -o jsonpath="{.status.phase}")" = "Running" ]'
+    hints:
+      - title: Always read the events first
+        cost: 8
+        text: |
+          ```
+          kubectl -n stuck describe pod too-big | tail -20
+          ```
+          The scheduler writes a `FailedScheduling` event that says exactly
+          which predicate failed: `Insufficient cpu`,
+          `node(s) didn't match Pod's node affinity/selector`, and so on.
+
+          `no-scheduler` has *no* events at all - because no scheduler is
+          watching for it. That absence is the clue.
+      - title: Most of a pod spec is immutable
+        cost: 8
+        text: |
+          You cannot patch resources, nodeSelector or nodeName on a live
+          pod. The workflow is:
+
+          ```
+          kubectl -n stuck get pod too-big -o yaml > fix.yaml
+          # edit, remove status/metadata noise
+          kubectl -n stuck delete pod too-big
+          kubectl apply -f fix.yaml
+          ```
+      - title: Bypassing the scheduler
+        cost: 12
+        text: |
+          Setting `spec.nodeName` tells the kubelet on that node to run the
+          pod directly - the scheduler is never involved:
+
+          ```yaml
+          spec:
+            nodeName: kubestronaut-worker
+            schedulerName: klab-does-not-exist
+            containers: [...]
+          ```
+          You must name a real node; a typo leaves the pod stuck forever
+          with no error.
+    solution: |
+      ```bash
+      kubectl -n stuck describe pod too-big | tail -10      # Insufficient cpu
+      kubectl -n stuck delete pod too-big bad-selector no-scheduler
+
+      NODE=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+
+      cat <<YAML | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: too-big, namespace: stuck}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {cpu: 100m}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: bad-selector, namespace: stuck}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: no-scheduler, namespace: stuck, labels: {klab: manual}}
+      spec:
+        nodeName: $NODE
+        schedulerName: klab-does-not-exist
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      YAML
+      ```
+    solve_script: |
+      kubectl -n stuck delete pod too-big bad-selector no-scheduler --wait=true
+      NODE=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+      cat <<YAML | kubectl apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: too-big, namespace: stuck}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+            resources:
+              requests: {cpu: 100m}
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: bad-selector, namespace: stuck}
+      spec:
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      ---
+      apiVersion: v1
+      kind: Pod
+      metadata: {name: no-scheduler, namespace: stuck, labels: {klab: manual}}
+      spec:
+        nodeName: $NODE
+        schedulerName: klab-does-not-exist
+        containers:
+          - name: c
+            image: registry.k8s.io/pause:3.9
+      YAML
+      sleep 20
